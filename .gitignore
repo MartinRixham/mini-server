@@ -1,3 +1,4 @@
 installer/.cache/
 installer/.vm/
 *.img
+installer/.vm-ci/

@@ -3,34 +3,37 @@
 #
 #   ./build-usb.sh --device /dev/sdX      write a USB stick (ERASES it on first run)
 #   ./build-usb.sh --render-only DIR      just render kickstarts + ventoy.json into DIR
+#   ./build-usb.sh --fetch-only           just download and verify the ISOs into .cache/
 #
 # Downloads (checksum-verified, cached in .cache/): Ventoy, the AlmaLinux boot
-# ISO and the Fedora Everything netinstall ISO. Settings come from config.env.
+# ISO and the Fedora Everything netinstall ISO. Settings come from config.env
+# (or the file named by $CONFIG).
 # Re-running on a stick that already has Ventoy only refreshes the files.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=config.env
-source "$HERE/config.env"
+source "${CONFIG:-$HERE/config.env}"
 CACHE="$HERE/.cache"
 mkdir -p "$CACHE"
 
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-DEVICE="" RENDER_DIR="" ALLOW_LOOP=""
+DEVICE="" RENDER_DIR="" ALLOW_LOOP="" FETCH_ONLY=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --device)      DEVICE=${2:?}; shift 2 ;;
         --render-only) RENDER_DIR=${2:?}; shift 2 ;;
+        --fetch-only)  FETCH_ONLY=1; shift ;;
         --allow-loop)  ALLOW_LOOP=1; shift ;;   # for building a test image on /dev/loopN
         -h|--help)     usage ;;
         *)             usage 1 ;;
     esac
 done
-[[ -n $DEVICE || -n $RENDER_DIR ]] || usage 1
+[[ -n $DEVICE || -n $RENDER_DIR || -n $FETCH_ONLY ]] || usage 1
 
 if [[ -n $ALMA_DISK_SERIAL && -z $BAZZITE_DISK_SERIAL ]] || [[ -z $ALMA_DISK_SERIAL && -n $BAZZITE_DISK_SERIAL ]]; then
     die "config.env: set both ALMA_DISK_SERIAL and BAZZITE_DISK_SERIAL, or neither"
@@ -157,7 +160,7 @@ install_ventoy() {
 }
 
 copy_to_stick() {
-    local mnt staged
+    # not local: the EXIT trap runs after this function has returned
     mnt=$(mktemp -d)
     staged=$(mktemp -d)
     trap 'sudo umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true; rm -rf "$staged"' EXIT
@@ -189,6 +192,10 @@ get_fedora
 if [[ -n $RENDER_DIR ]]; then
     render "$RENDER_DIR"
     info "rendered into $RENDER_DIR"
+    exit 0
+fi
+if [[ -n $FETCH_ONLY ]]; then
+    info "ISOs ready: $CACHE/$ALMA_ISO $CACHE/$FEDORA_ISO"
     exit 0
 fi
 check_device

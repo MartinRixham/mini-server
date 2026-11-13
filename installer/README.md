@@ -76,7 +76,19 @@ should. It also shellchecks every script. It needs only bash and shellcheck.
   (downloads Ventoy and both ISOs and verifies their checksums), then checks what
   ended up on the stick. The weekly run catches upstream URL or ISO changes.
 
-Neither job installs anything. Run `test-vm.sh` for that.
+- **vm-install** runs `tests/vm-install.sh`. It does the whole install unattended
+  in QEMU/KVM with two NVMe disks: AlmaLinux, then Silverblue, then the first-boot
+  rebase to signed Bazzite. It boots each installed system and checks it over SSH:
+  the partitions, the raid1 pool across both drives, the subvolumes, which drive
+  each `/boot` is on, and that Alma still boots after Bazzite is installed. It takes
+  1-2 hours. Logs and failure screenshots are uploaded as the `vm-install-logs`
+  artifact.
+
+  To run unattended, the ISO kernels are booted directly (not through Ventoy) and
+  each kickstart gets a CI add-on in place of the GUI questions. The add-on sets
+  text mode, language, keyboard, timezone, a throwaway root password, an SSH key and
+  poweroff. Disk serials are pinned. On an x86 machine with KVM you can run it
+  yourself: `tests/vm-install.sh all`.
 
 ## Known risks / unverified
 

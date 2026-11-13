@@ -20,10 +20,11 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # pinned: newer shellcheck versions add and drop warnings
       - name: Install shellcheck
-        run: sudo apt-get update -q && sudo apt-get install -yq shellcheck
+        run: pipx install shellcheck-py==0.11.0.1 && shellcheck --version
 
       - name: Kickstart %pre tests and shellcheck
         run: tests/test-kickstarts.sh --out "$RUNNER_TEMP/ks"
@@ -42,7 +43,7 @@ jobs:
           docker run --rm -v "$RUNNER_TEMP/ks:/ks:ro" "registry.fedoraproject.org/fedora:$FEDORA_VERSION" \
             sh -c "dnf -yq install pykickstart >/dev/null && ksvalidator -v F$FEDORA_VERSION /ks/silverblue.ks"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: kickstarts
@@ -55,7 +56,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build stick image
         run: |
@@ -90,3 +91,66 @@ jobs:
       - name: Detach loop device
         if: always()
         run: '[[ -z ${LOOP:-} ]] || sudo losetup -d "$LOOP"'
+
+  vm-install:
+    # Full unattended install in QEMU/KVM: Alma, Silverblue, the rebase to
+    # Bazzite, then Alma again. See tests/vm-install.sh. Takes 1-2 hours.
+    runs-on: ubuntu-24.04
+    needs: test
+    timeout-minutes: 330
+    concurrency:
+      group: vm-install-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends qemu-system-x86 qemu-utils ovmf xorriso jq
+
+      # The two VM disks grow to ~40 GB (raid1 writes everything twice).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt || true
+          best=$RUNNER_TEMP
+          if mountpoint -q /mnt && [[ $(df --output=avail /mnt | tail -1) -gt $(df --output=avail "$RUNNER_TEMP" | tail -1) ]]; then
+            best=/mnt
+          fi
+          sudo mkdir -p "$best/vm-ci" && sudo chown "$USER" "$best/vm-ci"
+          echo "VM_WORK=$best/vm-ci" >> "$GITHUB_ENV"
+          df -h "$best"
+
+      - name: Prepare (ISOs, kickstarts, blank disks)
+        run: tests/vm-install.sh --work "$VM_WORK" prepare
+
+      - name: Install AlmaLinux
+        run: tests/vm-install.sh --work "$VM_WORK" install-alma
+
+      - name: Check AlmaLinux
+        run: tests/vm-install.sh --work "$VM_WORK" check-alma
+
+      - name: Install Silverblue
+        run: tests/vm-install.sh --work "$VM_WORK" install-silverblue
+
+      - name: Check Silverblue, wait for the rebase to Bazzite, check again
+        run: tests/vm-install.sh --work "$VM_WORK" check-bazzite
+
+      - name: Check AlmaLinux still boots
+        run: tests/vm-install.sh --work "$VM_WORK" check-alma
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vm-install-logs
+          path: ${{ env.VM_WORK }}/logs
+          if-no-files-found: ignore

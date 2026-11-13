@@ -230,10 +230,10 @@ for ks in alma silverblue; do
 done
 awk '/<<.SCRIPT.$/ {on = 1; next} /^SCRIPT$/ {on = 0} on' "$WORK/silverblue.ks" > "$WORK/rebase.sh"
 if shellcheck -s bash "$WORK/rebase.sh"; then ok "rebase.sh"; else bad "rebase.sh"; fi
-if (cd "$HERE" && shellcheck -x build-usb.sh test-vm.sh tests/test-kickstarts.sh); then
-    ok "build-usb.sh test-vm.sh test-kickstarts.sh"
+if (cd "$HERE" && shellcheck -x build-usb.sh test-vm.sh tests/*.sh); then
+    ok "build-usb.sh test-vm.sh tests/*.sh"
 else
-    bad "build-usb.sh test-vm.sh test-kickstarts.sh"
+    bad "build-usb.sh test-vm.sh tests/*.sh"
 fi
 
 echo
