@@ -12,7 +12,10 @@
 #                       checks Alma still boots and sees @bazzite
 #   install-silverblue  boot the Fedora ISO with silverblue.ks
 #   check-bazzite       boot drive 2, check layout, wait for the rebase to finish
-#                       (signed Bazzite image booted), check again
+#                       (signed Bazzite booted, rebase service gone), check again,
+#                       then check it matches a fresh Bazzite install: no failed
+#                       units, no leftovers, one clean deployment, Bazzite's
+#                       image info, no Silverblue /etc kept by the merge
 #
 # Differences from a real install (only for unattended running):
 # - the ISOs' kernels are booted directly with inst.ks=, not through Ventoy
@@ -39,7 +42,7 @@ die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 [[ ${1:-} == --work ]] && { WORK=$(realpath -m "${2:?}"); shift 2; }
-[[ $# -gt 0 ]] || { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[[ $# -gt 0 ]] || { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 LOGS="$WORK/logs"
 mkdir -p "$LOGS"
 
@@ -263,7 +266,6 @@ if [[ $MODE == alma ]]; then
 else
     check "/sysroot is btrfs subvol @bazzite" test "$(findmnt -no FSTYPE /sysroot):$(fsroot /sysroot)" = btrfs:/@bazzite
     check "/boot on drive 2"        test "$(disk_holding /boot)" = "$B"
-    check "rebase service installed" test -x /etc/rebase-to-bazzite/rebase.sh
     POOL=/sysroot
 fi
 
@@ -311,23 +313,128 @@ step_check_alma() {
     stop
 }
 
+# --- "same as a fresh Bazzite install" checks (host side) ---------------------
+CHECK_FAILED=0
+ok()  { echo "  ok: $*"; }
+bad() { echo "  FAIL: $*"; CHECK_FAILED=1; }
+indent() { local l; while IFS= read -r l; do echo "        $l"; done; }
+
+# Fingerprint of each file under the booted image's default /etc (/usr/etc):
+# "<sha256 or link:target>  <path relative to /etc>".
+# shellcheck disable=SC2016  # expands in the guest
+USR_ETC_SUMS='cd /usr/etc && { find . -type f -exec sha256sum {} + && find . -type l -printf "link:%l  %p\n"; } | sed "s|  \./|  |"'
+
+# /etc files any install rewrites after an update (systemd-sysusers, ldconfig),
+# so they differ from the image default on a fresh install too.
+ETC_MERGE_ALLOW='^(passwd|group|shadow|gshadow|subuid|subgid)-?$|^ld\.so\.cache$'
+
+check_settled() {
+    local state failed
+    state=$(vm_ssh 'timeout 600 systemctl is-system-running --wait' 2>/dev/null || true)
+    failed=$(vm_ssh systemctl --failed --plain --no-legend 2>/dev/null || true)
+    if [[ $state == running ]]; then ok "system is running, no failed units"
+    else bad "system state '${state:-unknown}'; failed units:"; indent <<<"$failed"; fi
+}
+
+check_no_leftovers() {
+    local p
+    for p in /etc/rebase-to-bazzite /etc/systemd/system/rebase-to-bazzite.service \
+             /etc/systemd/system/multi-user.target.wants/rebase-to-bazzite.service \
+             /var/lib/rebase-to-bazzite; do
+        if vm_ssh test ! -e "$p"; then ok "$p removed"; else bad "$p still exists"; fi
+    done
+    local load; load=$(vm_ssh systemctl show -P LoadState rebase-to-bazzite.service || true)
+    if [[ $load == not-found ]]; then ok "rebase-to-bazzite.service unknown to systemd"
+    else bad "rebase-to-bazzite.service LoadState is '$load'"; fi
+}
+
+check_deployments() {  # wanted-image-ref
+    local status others local_state
+    status=$(vm_ssh rpm-ostree status --json)
+    # A staged automatic update of the same image is fine; anything else is not.
+    others=$(jq -r --arg w "$1" '.deployments[] | select(.["container-image-reference"] != $w)
+        | .["container-image-reference"] // .origin // "?"' <<<"$status")
+    if [[ -z $others ]]; then ok "every deployment is $1 (no rollback to Silverblue or unverified Bazzite)"
+    else bad "other deployments left:"; indent <<<"$others"; fi
+    local_state=$(jq -r '.deployments[] | select(.booted) | to_entries[]
+        | select(.key | test("^(requested-)?(packages|local-packages|base-removals|base-local-replacements|local-fileoverride-packages|modules)$|^initramfs-(args|etc)$"))
+        | select((.value // []) | length > 0) | "\(.key): \(.value | tostring)"' <<<"$status")
+    local_state+=$'\n'$(jq -r '.deployments[] | select(.booted)
+        | (if .["regenerate-initramfs"] == true then "regenerate-initramfs: true\n" else "" end)
+        + (if (.unlocked // "none") != "none" then "unlocked: \(.unlocked)\n" else "" end)' <<<"$status")
+    if [[ -z ${local_state//[[:space:]]/} ]]; then ok "no layered packages, overrides, initramfs changes or unlock"
+    else bad "booted deployment has local changes:"; indent <<<"$local_state"; fi
+}
+
+check_image_info() {  # needs BAZZITE_IMAGE, FEDORA_VERSION
+    local repo=${BAZZITE_IMAGE%:*} info id
+    info=$(vm_ssh cat /usr/share/ublue-os/image-info.json 2>/dev/null || true)
+    echo "  image-info: $(jq -c . <<<"$info" 2>/dev/null || echo "${info:-missing}")"
+    if jq -e --arg r "ostree-image-signed:docker://$repo" --arg n "${repo##*/}" \
+        '.["image-ref"] == $r and .["image-name"] == $n' <<<"$info" >/dev/null 2>&1
+    then ok "image-info.json names ${repo##*/} (ostree-image-signed:docker://$repo)"
+    else bad "image-info.json does not match $BAZZITE_IMAGE"; fi
+    if jq -e --arg v "$FEDORA_VERSION" '.["fedora-version"] == $v' <<<"$info" >/dev/null 2>&1
+    then ok "Bazzite is built on Fedora $FEDORA_VERSION"
+    else bad "Bazzite's fedora-version is not $FEDORA_VERSION (update FEDORA_VERSION in config.env)"; fi
+    # shellcheck disable=SC2016  # expands in the guest
+    id=$(vm_ssh '. /etc/os-release && echo "$ID"' || true)
+    if [[ $id == bazzite ]]; then ok "os-release ID is bazzite"; else bad "os-release ID is '$id'"; fi
+}
+
+# The rebases 3-way merge /etc: a file changed locally (at install time) keeps
+# the local version. That differs from a fresh Bazzite install when Bazzite's
+# default differs from Silverblue's (M/D), or when the file is Silverblue's and
+# Bazzite doesn't ship it at all (A). Local changes to files that both images
+# ship identically, and files neither ships, are what any install has.
+check_etc_merge() {  # config-diff silverblue-sums bazzite-sums
+    local -A sb=() bz=()
+    local h p kind before=$CHECK_FAILED
+    CHECK_FAILED=0
+    while read -r h p; do [[ -n $p ]] && sb[$p]=$h; done < "$2"
+    while read -r h p; do [[ -n $p ]] && bz[$p]=$h; done < "$3"
+    while read -r kind p; do
+        p=${p#./}; p=${p#/}
+        [[ -n $p && ! $p =~ $ETC_MERGE_ALLOW ]] || continue
+        case $kind in
+            A) [[ -z ${sb[$p]+set} ]] || bad "/etc/$p: Silverblue's file kept, Bazzite does not ship it" ;;
+            M|D) [[ ${sb[$p]:-absent} == "${bz[$p]:-absent}" ]] \
+                   || bad "/etc/$p ($kind): local version kept over Bazzite's different default" ;;
+        esac
+    done < "$1"
+    [[ $CHECK_FAILED == 1 ]] || ok "/etc keeps nothing from Silverblue that a fresh install would not have"
+    CHECK_FAILED=$((before | CHECK_FAILED))
+}
+
 step_check_bazzite() {
     [[ -f $WORK/silverblue.done ]] || die "run install-silverblue first"
     # shellcheck source=/dev/null
     source "$WORK/config.env"
+    local want="ostree-image-signed:docker://$BAZZITE_IMAGE" last="" ref
+    local sb_sums=$WORK/silverblue-usr-etc.sums
     boot "$BAZZITE_SERIAL" boot-bazzite
     guest_check bazzite
-    vm_ssh systemctl is-enabled rebase-to-bazzite.service >/dev/null \
-        || [[ -n $(vm_ssh 'ls /var/lib/rebase-to-bazzite/done 2>/dev/null') ]] \
-        || die "rebase-to-bazzite.service is not enabled"
+    ref=$(booted_image || true)
+    if [[ $ref == *fedora-silverblue* ]]; then
+        vm_ssh test -x /etc/rebase-to-bazzite/rebase.sh || die "rebase script not installed"
+        vm_ssh systemctl is-enabled rebase-to-bazzite.service >/dev/null \
+            || die "rebase-to-bazzite.service is not enabled"
+        # Silverblue's default /etc, for check_etc_merge after the rebase.
+        vm_ssh "$USR_ETC_SUMS" > "$sb_sums"
+        info "fingerprinted $(wc -l < "$sb_sums") files in Silverblue's /usr/etc"
+    fi
+    [[ -s $sb_sums ]] || die "no Silverblue /usr/etc fingerprints (booted '$ref'; rerun from prepare)"
 
-    local want="ostree-image-signed:docker://$BAZZITE_IMAGE" last="" ref
+    # Finished = signed image booted and the service has deleted itself.
+    # shellcheck disable=SC2016  # expands in the guest
+    local gone='test ! -e /etc/systemd/system/rebase-to-bazzite.service && test ! -e /etc/rebase-to-bazzite &&
+        [ "$(systemctl show -P ActiveState rebase-to-bazzite.service)" = inactive ] && echo gone'
     local deadline=$((SECONDS + REBASE_TIMEOUT_MIN * 60))
     info "waiting for the rebase to $want (timeout ${REBASE_TIMEOUT_MIN} min)"
     while :; do
         ref=$(booted_image || true)
         if [[ -n $ref && $ref != "$last" ]]; then info "booted image: $ref"; last=$ref; fi
-        if [[ $ref == "$want" ]] && vm_ssh test -e /var/lib/rebase-to-bazzite/done 2>/dev/null; then
+        if [[ $ref == "$want" && $(vm_ssh "$gone" 2>/dev/null) == gone ]]; then
             break
         fi
         if [[ $SECONDS -ge $deadline ]]; then
@@ -341,10 +448,20 @@ step_check_bazzite() {
     vm_ssh journalctl -u rebase-to-bazzite --no-pager > "$LOGS/rebase-to-bazzite.log" 2>&1 || true
     vm_ssh rpm-ostree status
     guest_check bazzite
-    local state
-    state=$(vm_ssh systemctl is-enabled rebase-to-bazzite.service 2>/dev/null || true)
-    [[ $state == disabled ]] || die "rebase-to-bazzite.service is still '$state' after finishing"
-    info "rebase done; service disabled itself"
+
+    info "checks (same as a fresh Bazzite install)"
+    check_settled
+    vm_ssh cat /proc/cmdline > "$LOGS/bazzite-cmdline.txt" || true
+    vm_ssh systemctl list-units --all --no-pager > "$LOGS/bazzite-units.txt" 2>&1 || true
+    check_no_leftovers
+    check_deployments "$want"
+    check_image_info
+    vm_ssh ostree admin config-diff > "$LOGS/bazzite-config-diff.txt"
+    vm_ssh "$USR_ETC_SUMS" > "$LOGS/bazzite-usr-etc.sums"
+    cp "$sb_sums" "$LOGS/"
+    check_etc_merge "$LOGS/bazzite-config-diff.txt" "$sb_sums" "$LOGS/bazzite-usr-etc.sums"
+    [[ $CHECK_FAILED == 0 ]] || die "Bazzite differs from a fresh install (see above and $LOGS)"
+    info "rebase done; matches a fresh Bazzite install"
     stop
 }
 

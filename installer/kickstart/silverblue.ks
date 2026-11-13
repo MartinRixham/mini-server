@@ -92,17 +92,18 @@ cat /tmp/part.ks
 set -euo pipefail
 
 # /etc, not /usr/local: on ostree /usr/local points into /var, which is not
-# populated yet at install time. /etc is carried across both rebases.
+# populated yet at install time. /etc is carried across both rebases. The
+# script deletes all of this once Bazzite (signed) is booted.
 mkdir -p /etc/rebase-to-bazzite
 
 cat > /etc/rebase-to-bazzite/rebase.sh <<'SCRIPT'
 #!/bin/bash
-# First-boot: Silverblue -> Bazzite (unverified) -> Bazzite (signed), then disable.
+# First-boot: Silverblue -> Bazzite (unverified) -> Bazzite (signed), then drops
+# the rollback deployment and deletes itself and its unit.
 # Bazzite's documented two-step rebase: the first image installs the signing
 # policy needed to verify the second.
 set -euo pipefail
 IMAGE="@BAZZITE_IMAGE@"
-STATE=/var/lib/rebase-to-bazzite
 
 booted_ref=$(rpm-ostree status --booted --json | python3 -c '
 import json, sys
@@ -112,9 +113,18 @@ echo "booted image: $booted_ref"
 
 case $booted_ref in
     "ostree-image-signed:docker://$IMAGE")
-        echo "Bazzite (signed) is booted - done."
-        touch "$STATE/done"
-        systemctl disable rebase-to-bazzite.service
+        # Leave what a fresh Bazzite install has: one deployment and none of
+        # this. Each step is safe to repeat if a later one fails and the
+        # service restarts.
+        echo "Bazzite (signed) is booted - cleaning up."
+        rpm-ostree cleanup --rollback
+        # On a retry the unit file may already be gone, and disable would fail.
+        systemctl disable rebase-to-bazzite.service || true
+        rm -f /etc/systemd/system/rebase-to-bazzite.service \
+              /etc/systemd/system/multi-user.target.wants/rebase-to-bazzite.service
+        rm -rf /etc/rebase-to-bazzite
+        systemctl daemon-reload
+        echo "done - this unit and its script are removed."
         exit 0 ;;
     "ostree-unverified-registry:$IMAGE")
         target="ostree-image-signed:docker://$IMAGE" ;;
@@ -133,12 +143,10 @@ cat > /etc/systemd/system/rebase-to-bazzite.service <<'UNIT'
 Description=Rebase this Silverblue install to Bazzite
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=!/var/lib/rebase-to-bazzite/done
 StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-StateDirectory=rebase-to-bazzite
 ExecStart=/etc/rebase-to-bazzite/rebase.sh
 Restart=on-failure
 RestartSec=60

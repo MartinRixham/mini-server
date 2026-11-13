@@ -51,7 +51,8 @@ turn Secure Boot off for the install.
    `rebase-to-bazzite.service` downloads Bazzite (~8 GB), reboots itself, does the second
    (signed-image) rebase and reboots again. Watch it with
    `journalctl -fu rebase-to-bazzite`. If the network is down it retries every minute.
-   It's finished when `rpm-ostree status` shows `ostree-image-signed:docker://ghcr.io/ublue-os/bazzite:…`.
+   When it's done, it drops the rollback deployment and deletes itself, so
+   `rpm-ostree status` shows a single `ostree-image-signed:docker://ghcr.io/ublue-os/bazzite:…` deployment.
 
 Choose which distro boots using the firmware boot menu, or set the default with
 `efibootmgr --bootorder`.
