@@ -90,3 +90,16 @@ btrfs /home --subvol --name=@alma_home LABEL=$POOL_LABEL
 EOF
 cat /tmp/part.ks
 %end
+
+%post --interpreter=/bin/bash --erroronfail --log=/root/ks-post.log
+set -euo pipefail
+
+@DEGRADED_BOOT@
+
+# The degraded entry needs the udev rule in the initramfs too, where the root
+# filesystem is mounted. dracut keeps it in every initramfs it builds from now on.
+cat > /etc/dracut.conf.d/minipool-degraded.conf <<'EOF'
+install_items+=" /etc/udev/rules.d/65-minipool-degraded.rules "
+EOF
+dracut -f --regenerate-all
+%end

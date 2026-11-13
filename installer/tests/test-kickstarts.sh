@@ -41,6 +41,7 @@ render() {  # name alma-serial bazzite-serial
         -e "s|@BAZZITE_IMAGE@|$BAZZITE_IMAGE|g" \
         -e "s|@ALMA_DISK_SERIAL@|$2|g" \
         -e "s|@BAZZITE_DISK_SERIAL@|$3|g" \
+        -e "/^@DEGRADED_BOOT@\$/{r $HERE/kickstart/degraded-boot.sh" -e 'd' -e '}' \
         "$HERE/kickstart/$1.ks"
 }
 
@@ -213,6 +214,110 @@ expect_refusal "both disks already have an ESP" "could not tell drives apart" si
 alma_installed; add_esp nvme1n1
 expect_refusal "Bazzite already installed (serials given)" "already has an EFI partition" silverblue SER-A SER-B
 
+# --- degraded boot entry ---------------------------------------------------------
+echo "degraded-boot-entry"
+
+for ks in alma silverblue; do
+    render "$ks" "" "" > "$WORK/$ks.ks"
+    if grep -q '@[A-Z_]*@' "$WORK/$ks.ks"; then bad "$ks.ks: unfilled placeholder"; grep -n '@[A-Z_]*@' "$WORK/$ks.ks"
+    elif ! section "$WORK/$ks.ks" %post | grep -q 'systemctl enable minipool-degraded-boot.service'; then
+        bad "$ks.ks: %post does not set up the degraded boot entry"
+    else ok "$ks.ks %post sets up the degraded boot entry"; fi
+done
+expect() { local d=$1; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
+expect "alma.ks puts the udev rule in the initramfs" \
+    grep -qF 'install_items+=" /etc/udev/rules.d/65-minipool-degraded.rules "' "$WORK/alma.ks"
+# shellcheck disable=SC2016  # literal text in the kickstart
+expect "rebase.sh puts the udev rule in the initramfs" \
+    grep -qF 'rpm-ostree initramfs-etc --track="$DEGRADED_RULE"' "$WORK/silverblue.ks"
+
+awk "/<<'ENTRYSCRIPT'\$/ {on = 1; next} /^ENTRYSCRIPT\$/ {on = 0} on" "$WORK/alma.ks" > "$WORK/degraded-boot-entry"
+chmod +x "$WORK/degraded-boot-entry"
+
+# A fake /boot with BLS entries, plus stubs for grub2-editenv, findmnt, mount.
+new_boot() {  # [saved_entry]
+    B="$WORK/boot.$RANDOM"
+    mkdir -p "$B/loader/entries" "$B/grub2" "$B/bin"
+    printf 'saved_entry=%s\n' "${1:-}" > "$B/grubenv"
+    printf '#!/bin/bash\ncat %q\n' "$B/grubenv" > "$B/bin/grub2-editenv"
+    printf '#!/bin/bash\necho 1234-abcd\n' > "$B/bin/findmnt"
+    printf '#!/bin/bash\necho "mount $*" >> %q\n' "$B/mount.log" > "$B/bin/mount"
+    chmod +x "$B"/bin/*
+}
+entry() {  # name, then lines
+    local name=$1; shift
+    printf '%s\n' "$@" > "$B/loader/entries/$name.conf"
+}
+run_entry() { PATH="$B/bin:$PATH" MINIPOOL_BOOT=$B "$WORK/degraded-boot-entry" > "$B/out.log" 2>&1; }
+cfg_has() {  # description fixed-string
+    if grep -qF -- "$2" "$B/grub2/custom.cfg"; then ok "$1"; else bad "$1 (no '$2')"; cat "$B/grub2/custom.cfg"; fi
+}
+grub_syntax() {
+    if ! command -v grub2-script-check >/dev/null; then echo "  (grub2-script-check not installed - GRUB syntax not checked)"; return; fi
+    if grub2-script-check "$B/grub2/custom.cfg"; then ok "custom.cfg is valid GRUB script"; else bad "custom.cfg is valid GRUB script"; fi
+}
+
+# Alma: saved_entry picks the entry, even when a newer kernel is installed.
+new_boot mid-6.12.0-55.el10.x86_64
+entry mid-6.12.0-60.el10.x86_64 "title AlmaLinux (6.12.0-60) 10.1" "version 6.12.0-60.el10.x86_64" \
+    "linux /vmlinuz-6.12.0-60.el10.x86_64" "options root=UUID=p ro rootflags=subvol=@alma"
+entry mid-6.12.0-55.el10.x86_64 "title AlmaLinux (6.12.0-55) 10.1 'Kitten'" "version 6.12.0-55.el10.x86_64" \
+    "linux /vmlinuz-6.12.0-55.el10.x86_64" "initrd /initramfs-6.12.0-55.el10.x86_64.img \$tuned_initrd" \
+    "options root=UUID=p ro rootflags=subvol=@alma rhgb quiet \$tuned_params" "grub_class almalinux"
+entry mid-0-rescue "title AlmaLinux rescue" "version 0-rescue" "linux /vmlinuz-0-rescue" "options root=UUID=p"
+# shellcheck disable=SC2016  # the $... below are GRUB variables, kept literally
+if run_entry; then
+    ok "Alma-style entries"
+    cfg_has "copies the saved_entry kernel" 'linux /vmlinuz-6.12.0-55.el10.x86_64 root=UUID=p ro rootflags=subvol=@alma,degraded rhgb quiet $tuned_params'
+    cfg_has "copies the initrd"            '  initrd /initramfs-6.12.0-55.el10.x86_64.img $tuned_initrd'
+    cfg_has "quotes the title"             "menuentry 'AlmaLinux (6.12.0-55) 10.1 '\''Kitten'\'' - one SSD missing (degraded)' --id minipool-degraded {"
+    cfg_has "finds /boot by UUID"          'search --no-floppy --fs-uuid --set=root 1234-abcd'
+    cfg_has "boot-once switch"             'if [ "${minipool_boot_once}" = degraded ]; then'
+    grub_syntax
+    if [[ ! -e $B/mount.log ]]; then ok "no remount when /boot is writable"; else bad "remounted a writable /boot"; fi
+    before=$(stat -c %Y.%i "$B/grub2/custom.cfg")
+    if run_entry && [[ $(stat -c %Y.%i "$B/grub2/custom.cfg") == "$before" && ! -s $B/out.log ]]; then
+        ok "unchanged entry is not rewritten"
+    else bad "unchanged entry is not rewritten"; fi
+    rm "$B/loader/entries/mid-6.12.0-55.el10.x86_64.conf"
+    run_entry && cfg_has "falls back to the newest kernel when saved_entry is gone" 'linux /vmlinuz-6.12.0-60.el10.x86_64 '
+else
+    bad "Alma-style entries"; cat "$B/out.log"
+fi
+
+# ostree: no saved_entry; the highest version is the default deployment.
+new_boot
+entry ostree-1 "title Fedora Linux 45 (ostree:1)" "version 1" "linux /ostree/default-old/vmlinuz" \
+    "initrd /ostree/default-old/initramfs.img" "options root=UUID=p rootflags=subvol=@bazzite ostree=/ostree/boot.1/default/old/0"
+entry ostree-2 "title Fedora Linux 45 (ostree:0)" "version 2" "linux /ostree/default-new/vmlinuz" \
+    "initrd /ostree/default-new/initramfs.img" "initrd /ostree/initramfs-overlays/abc.img" \
+    "options root=UUID=p rootflags=subvol=@bazzite ostree=/ostree/boot.1/default/new/0"
+if run_entry; then
+    ok "ostree-style entries"
+    cfg_has "copies the newest deployment" 'linux /ostree/default-new/vmlinuz root=UUID=p rootflags=subvol=@bazzite,degraded ostree=/ostree/boot.1/default/new/0'
+    cfg_has "joins initrd lines"           '  initrd /ostree/default-new/initramfs.img /ostree/initramfs-overlays/abc.img'
+    grub_syntax
+else
+    bad "ostree-style entries"; cat "$B/out.log"
+fi
+
+new_boot
+entry plain "title Plain" "version 1" "linux /vmlinuz" "options root=LABEL=minipool ro"
+if run_entry; then cfg_has "adds rootflags=degraded when there is none" 'linux /vmlinuz root=LABEL=minipool ro rootflags=degraded'
+else bad "entry without rootflags"; cat "$B/out.log"; fi
+if grep -q initrd "$B/grub2/custom.cfg"; then bad "no initrd line when the entry has none"; else ok "no initrd line when the entry has none"; fi
+grub_syntax
+
+new_boot
+entry plain "title Plain" "version 1" "linux /vmlinuz" "options ro"
+echo "menuentry mine {}" > "$B/grub2/custom.cfg"
+if run_entry && [[ $(cat "$B/grub2/custom.cfg") == "menuentry mine {}" ]]; then
+    ok "leaves a custom.cfg it did not write alone"
+else bad "leaves a custom.cfg it did not write alone"; fi
+
+new_boot
+if run_entry; then bad "fails without boot entries"; else ok "fails without boot entries"; fi
+
 # --- shellcheck ----------------------------------------------------------------
 echo "shellcheck"
 for ks in alma silverblue; do
@@ -230,6 +335,7 @@ for ks in alma silverblue; do
 done
 awk '/<<.SCRIPT.$/ {on = 1; next} /^SCRIPT$/ {on = 0} on' "$WORK/silverblue.ks" > "$WORK/rebase.sh"
 if shellcheck -s bash "$WORK/rebase.sh"; then ok "rebase.sh"; else bad "rebase.sh"; fi
+if shellcheck -s bash "$WORK/degraded-boot-entry"; then ok "degraded-boot-entry"; else bad "degraded-boot-entry"; fi
 if (cd "$HERE" && shellcheck -x build-usb.sh test-vm.sh tests/*.sh); then
     ok "build-usb.sh test-vm.sh tests/*.sh"
 else

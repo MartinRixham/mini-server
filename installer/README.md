@@ -10,6 +10,24 @@ One Ventoy USB stick that installs the mini server from scratch:
 Both root filesystems are subvolumes of one btrfs **raid1** pool (label `minipool`)
 spanning both drives: `@alma`, `@alma_home`, `@bazzite`.
 
+Each distro also gets a **"… - one SSD missing (degraded)"** boot entry, so it
+can still boot when the other drive dies. See
+[If an SSD dies](../README.md#if-an-ssd-dies). It is made of three parts, all
+set up by `kickstart/degraded-boot.sh`, which `build-usb.sh` pastes into both
+kickstarts' `%post`:
+- `/boot/grub2/custom.cfg` holds the entry: a copy of the default entry with
+  `,degraded` added to `rootflags=`. `minipool-degraded-boot.service` rewrites it
+  at every boot and shutdown, so it follows kernel and ostree updates. Both
+  Alma's `grub.cfg` and Fedora's static one source `custom.cfg`.
+- `rootflags=degraded` on its own isn't enough. systemd's `64-btrfs.rules`
+  never marks a pool with a missing member as ready, so the root mount waits
+  until it times out. `/etc/udev/rules.d/65-minipool-degraded.rules` marks it
+  ready, but only on a degraded boot.
+- That rule must also be in the initramfs. Alma adds it with a `dracut.conf.d`
+  file. Bazzite's initramfs comes prebuilt in the image, so the first-boot
+  service adds the rule with `rpm-ostree initramfs-etc` and reboots one more
+  time. That overlay is the one way Bazzite differs from a fresh ISO install.
+
 Each step is the distro's own graphical installer. A kickstart fills in the disk
 layout and software, and leaves you to fill in language, keyboard, **network/WiFi**,
 hostname, timezone, root password and user account.
@@ -81,8 +99,12 @@ should. It also shellchecks every script. It needs only bash and shellcheck.
   in QEMU/KVM with two NVMe disks: AlmaLinux, then Silverblue, then the first-boot
   rebase to signed Bazzite. It boots each installed system and checks it over SSH:
   the partitions, the raid1 pool across both drives, the subvolumes, which drive
-  each `/boot` is on, and that Alma still boots after Bazzite is installed. It takes
-  1-2 hours. Logs and failure screenshots are uploaded as the `vm-install-logs`
+  each `/boot` is on, and that Alma still boots after Bazzite is installed. Then
+  each drive "dies" in turn, on throwaway qcow2 overlays of the installed disks.
+  The other distro is booted from its degraded entry with a blank disk in the
+  dead one's place. The pool is rebuilt onto the blank disk with the commands in
+  the main README. Finally it boots normally again and checks that every chunk
+  is RAID1. It takes 1.5-2.5 hours. Logs and failure screenshots are uploaded as the `vm-install-logs`
   artifact.
 
   To run unattended, the ISO kernels are booted directly (not through Ventoy) and
@@ -104,6 +126,7 @@ should. It also shellchecks every script. It needs only bash and shellcheck.
 - **A rebased Bazzite isn't byte-identical to an ISO install.** Things the Bazzite ISO
   sets up at install time (e.g. preinstalled Flatpaks) may need doing by hand.
   Bazzite's `ujust` commands cover most of it.
-- **If one SSD dies, neither distro boots normally.** A degraded raid1 won't mount on its own.
-  Add `rootflags=degraded` to the kernel command line once, then replace the drive with
-  `btrfs replace` and rebalance.
+- **If one SSD dies, only the other drive's distro boots, and only from its degraded
+  entry.** The dead drive held the other distro's ESP and `/boot`. CI tests booting
+  degraded and rebuilding the pool. Rebuilding the lost distro's boot partitions
+  (step 3 of [If an SSD dies](../README.md#if-an-ssd-dies)) is untested.

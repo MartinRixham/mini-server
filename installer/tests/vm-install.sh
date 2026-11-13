@@ -16,6 +16,11 @@
 #                       then check it matches a fresh Bazzite install: no failed
 #                       units, no leftovers, one clean deployment, Bazzite's
 #                       image info, no Silverblue /etc kept by the merge
+#   degraded-alma       drive 2 dies: on throwaway overlays of the disks, pick
+#                       Alma's degraded entry, swap drive 2 for a blank disk,
+#                       boot with one SSD missing, rebuild the pool onto the
+#                       blank disk as README.md says, boot normally, check raid1
+#   degraded-bazzite    the same with drive 1 dying and Bazzite surviving
 #
 # Differences from a real install (only for unattended running):
 # - the ISOs' kernels are booted directly with inst.ks=, not through Ventoy
@@ -42,9 +47,13 @@ die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 [[ ${1:-} == --work ]] && { WORK=$(realpath -m "${2:?}"); shift 2; }
-[[ $# -gt 0 ]] || { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[[ $# -gt 0 ]] || { sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$0"; exit 1; }
 LOGS="$WORK/logs"
 mkdir -p "$LOGS"
+# The VM's disks as file:serial, and its firmware variables. The degraded
+# steps swap in overlays and a blank disk.
+DISKS=("$WORK/disk1.qcow2:$ALMA_SERIAL" "$WORK/disk2.qcow2:$BAZZITE_SERIAL")
+VARS=$WORK/vars.fd
 
 # --- QEMU --------------------------------------------------------------------
 find_ovmf() {
@@ -68,19 +77,19 @@ accel() {
     fi
 }
 
-# Common VM: two NVMe disks; $1 = serial of the disk to boot first (or "").
+# Common VM: the NVMe disks in DISKS; $1 = serial of the disk to boot first (or "").
 qemu_args() {
     local boot=$1 code
     code=$(find_ovmf); code=${code%%:*}
     # shellcheck disable=SC2207  # word splitting of accel() is intended
     QEMU=(qemu-system-x86_64 -machine q35 $(accel) -smp 4 -m 6G
           -drive "if=pflash,format=raw,readonly=on,file=$code"
-          -drive "if=pflash,format=raw,file=$WORK/vars.fd")
-    local n serial bootindex
-    for n in 1 2; do
-        serial=$ALMA_SERIAL; [[ $n == 2 ]] && serial=$BAZZITE_SERIAL
+          -drive "if=pflash,format=raw,file=$VARS")
+    local n=0 d serial bootindex
+    for d in "${DISKS[@]}"; do
+        n=$((n + 1)) serial=${d##*:}
         bootindex=""; [[ $serial == "$boot" ]] && bootindex=,bootindex=1
-        QEMU+=(-drive "if=none,id=d$n,format=qcow2,file=$WORK/disk$n.qcow2"
+        QEMU+=(-drive "if=none,id=d$n,format=qcow2,file=${d%:*}"
                -device "nvme,serial=$serial,drive=d$n$bootindex")
     done
     QEMU+=(-device virtio-vga -display none
@@ -269,6 +278,20 @@ else
     POOL=/sysroot
 fi
 
+# The "one SSD missing (degraded)" boot entry and what it needs.
+cfg=/boot/grub2/custom.cfg
+check "booted normally, not degraded" bash -c '! grep -Eq "rootflags=[^ ]*degraded" /proc/cmdline'
+check "degraded udev rule installed" test -s /etc/udev/rules.d/65-minipool-degraded.rules
+check "minipool-degraded-boot.service is active" systemctl is-active minipool-degraded-boot.service
+check "custom.cfg has the degraded entry" grep -q -- "--id minipool-degraded" "$cfg"
+check "degraded entry adds degraded to rootflags" grep -Eq "^  linux .* rootflags=([^ ]*,)?degraded( |$)" "$cfg"
+kernel=$(awk '$1 == "linux" {print $2; exit}' "$cfg" 2>/dev/null || true)
+check "degraded entry's kernel exists (/boot$kernel)" test -f "/boot$kernel"
+if [[ $MODE == alma ]]; then
+    check "initramfs has the degraded udev rule" \
+        bash -c "lsinitrd /boot/initramfs-\$(uname -r).img | grep -q 65-minipool-degraded.rules"
+fi
+
 show=$(btrfs filesystem show "$POOL")
 check "pool is labelled minipool" grep -q "Label: 'minipool'" <<<"$show"
 check "pool has 2 devices"        grep -q "Total devices 2" <<<"$show"
@@ -349,6 +372,8 @@ check_no_leftovers() {
     else bad "rebase-to-bazzite.service LoadState is '$load'"; fi
 }
 
+DEGRADED_RULE=/etc/udev/rules.d/65-minipool-degraded.rules
+
 check_deployments() {  # wanted-image-ref
     local status others local_state
     status=$(vm_ssh rpm-ostree status --json)
@@ -359,12 +384,18 @@ check_deployments() {  # wanted-image-ref
     else bad "other deployments left:"; indent <<<"$others"; fi
     local_state=$(jq -r '.deployments[] | select(.booted) | to_entries[]
         | select(.key | test("^(requested-)?(packages|local-packages|base-removals|base-local-replacements|local-fileoverride-packages|modules)$|^initramfs-(args|etc)$"))
-        | select((.value // []) | length > 0) | "\(.key): \(.value | tostring)"' <<<"$status")
+        | select((.value // []) | length > 0)
+        | select(.key != "initramfs-etc" or .value != [$rule]) | "\(.key): \(.value | tostring)"' \
+        --arg rule "$DEGRADED_RULE" <<<"$status")
     local_state+=$'\n'$(jq -r '.deployments[] | select(.booted)
         | (if .["regenerate-initramfs"] == true then "regenerate-initramfs: true\n" else "" end)
         + (if (.unlocked // "none") != "none" then "unlocked: \(.unlocked)\n" else "" end)' <<<"$status")
     if [[ -z ${local_state//[[:space:]]/} ]]; then ok "no layered packages, overrides, initramfs changes or unlock"
     else bad "booted deployment has local changes:"; indent <<<"$local_state"; fi
+    # The one deliberate difference: the degraded boot entry's udev rule.
+    if jq -e --arg r "$DEGRADED_RULE" '.deployments[] | select(.booted) | (.["initramfs-etc"] // []) | index($r)' \
+        <<<"$status" >/dev/null; then ok "initramfs-etc adds $DEGRADED_RULE"
+    else bad "initramfs-etc does not track $DEGRADED_RULE"; fi
 }
 
 check_image_info() {  # needs BAZZITE_IMAGE, FEDORA_VERSION
@@ -503,8 +534,120 @@ step_check_bazzite() {
     stop
 }
 
+# --- one SSD dies ----------------------------------------------------------------
+# Next boot only: the degraded entry (README.md has the same command).
+# shellcheck disable=SC2016  # expands in the guest
+BOOT_DEGRADED_ONCE='unshare -m sh -c "test -w /boot/grub2 || mount -o remount,rw /boot
+    test -e /boot/grub2/grubenv || grub2-editenv - create
+    grub2-editenv - set minipool_boot_once=degraded"'
+
+# Runs in the guest with POOL, BLANK (serial) and DEAD (1|2) prepended. The
+# same steps as "If an SSD dies" in README.md.
+REBUILD=$(cat <<'EOF'
+set -euo pipefail
+NEW=/dev/$(lsblk -dno NAME,SERIAL | awk -v s="$BLANK" '$2 == s {print $1}')
+[[ $NEW != /dev/ ]] || { echo "blank disk $BLANK not found"; exit 1; }
+show=$(btrfs filesystem show "$POOL"); echo "$show"
+MEMBER=$(awk '$1 == "devid" && $NF ~ "^/dev/" {print $NF}' <<<"$show")
+DEVID=$(awk '$1 == "devid" && tolower($0) ~ /missing/ {print $2}' <<<"$show")
+[[ -n $MEMBER && -n $DEVID ]] || { echo "could not tell the surviving member from the missing one"; exit 1; }
+MIB=$(( ($(blockdev --getsize64 "$MEMBER") + 1048575) / 1048576 ))
+echo "replacing devid $DEVID with a ${MIB} MiB partition on $NEW"
+if [[ $DEAD == 2 ]]; then
+    echo "size=${MIB}MiB, type=linux" | sfdisk --label gpt "$NEW"
+    PART=${NEW}p1
+else
+    printf 'size=600MiB, type=uefi\nsize=2048MiB, type=linux\nsize=%sMiB, type=linux\n' "$MIB" | sfdisk --label gpt "$NEW"
+    PART=${NEW}p3
+fi
+udevadm settle
+btrfs replace start -B "$DEVID" "$PART" "$POOL"
+btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft "$POOL"
+btrfs scrub start -B "$POOL"
+btrfs filesystem show "$POOL"
+btrfs filesystem df "$POOL"
+EOF
+)
+
+check_pool() {  # pool-path degraded|healthy
+    local show df other
+    show=$(vm_ssh btrfs filesystem show "$1")
+    df=$(vm_ssh btrfs filesystem df "$1")
+    indent <<<"$show"
+    if [[ $2 == degraded ]]; then
+        if grep -qi missing <<<"$show"; then ok "pool reports a missing device"
+        else bad "pool does not report a missing device"; fi
+        return
+    fi
+    if grep -q "Total devices 2" <<<"$show" && ! grep -qi missing <<<"$show"; then
+        ok "pool has 2 devices, none missing"
+    else bad "pool is not whole again"; fi
+    other=$(grep -E '^(Data|Metadata|System), ' <<<"$df" | grep -v ', RAID1:' || true)
+    if [[ -z $other ]] && grep -q '^Data, RAID1:' <<<"$df"; then ok "data, metadata and system are all RAID1"
+    else bad "chunks that are not RAID1:"; indent <<<"${other:-$df}"; fi
+}
+
+step_degraded() {  # alma|bazzite: the distro whose drive survives
+    [[ -f $WORK/silverblue.done ]] || die "run install-silverblue first"
+    local who=$1 keep dead pool t=$WORK/degraded-$1 n
+    if [[ $who == alma ]]; then keep=$ALMA_SERIAL dead=2 pool=/
+    else keep=$BAZZITE_SERIAL dead=1 pool=/var; fi   # Bazzite's / is not the pool; /var is, read-write
+    local blank=VMBLANK000$dead
+    rm -rf "$t"; mkdir -p "$t"
+    for n in 1 2; do qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/disk$n.qcow2" "$t/disk$n.qcow2"; done
+    qemu-img create -q -f qcow2 "$t/blank.qcow2" 80G
+    cp "$WORK/vars.fd" "$t/vars.fd"
+    VARS=$t/vars.fd
+    DISKS=("$t/disk1.qcow2:$ALMA_SERIAL" "$t/disk2.qcow2:$BAZZITE_SERIAL")
+
+    boot "$keep" "degraded-$who-1-healthy"
+    vm_ssh "$BOOT_DEGRADED_ONCE"
+    stop
+
+    DISKS[dead - 1]="$t/blank.qcow2:$blank"
+    info "drive $dead swapped for a blank disk"
+    boot "$keep" "degraded-$who-2-degraded"
+    info "checks (one SSD missing)"
+    local cmdline; cmdline=$(vm_ssh cat /proc/cmdline)
+    if [[ $cmdline =~ rootflags=([^\ ]*,)?degraded ]]; then ok "booted the degraded entry"
+    else bad "booted without degraded: $cmdline"; fi
+    if [[ $who == alma ]]; then
+        if [[ $(vm_ssh findmnt -no FSROOT /):$(vm_ssh findmnt -no FSROOT /home) == /@alma:/@alma_home ]]
+        then ok "/ and /home are mounted"; else bad "/ or /home is not mounted"; fi
+    else
+        if [[ $(vm_ssh findmnt -no FSROOT /sysroot) == /@bazzite ]]; then ok "/sysroot is mounted"
+        else bad "/sysroot is not mounted"; fi
+    fi
+    check_pool "$pool" degraded
+    check_settled
+    [[ $CHECK_FAILED == 0 ]] || die "degraded boot of $who failed the checks"
+
+    info "rebuilding the pool onto the blank disk"
+    if ! { echo "POOL=$pool BLANK=$blank DEAD=$dead"; echo "$REBUILD"; } \
+        | vm_ssh bash -s > "$LOGS/degraded-$who-rebuild.log" 2>&1; then
+        indent < "$LOGS/degraded-$who-rebuild.log"
+        die "rebuild failed (see $LOGS/degraded-$who-rebuild.log)"
+    fi
+    indent < "$LOGS/degraded-$who-rebuild.log"
+    check_pool "$pool" healthy
+    stop
+
+    boot "$keep" "degraded-$who-3-rebuilt"
+    info "checks (normal boot after the rebuild)"
+    cmdline=$(vm_ssh cat /proc/cmdline)
+    if [[ $cmdline =~ degraded ]]; then bad "the degraded entry booted again: $cmdline"
+    else ok "the normal entry booted"; fi
+    check_pool "$pool" healthy
+    check_settled
+    [[ $CHECK_FAILED == 0 ]] || die "$who after the rebuild failed the checks"
+    stop
+    rm -rf "$t"
+    info "$who survives drive $dead dying, and the pool is raid1 again"
+}
+
 steps=("$@")
-[[ ${steps[*]} == all ]] && steps=(prepare install-alma check-alma install-silverblue check-bazzite check-alma)
+[[ ${steps[*]} == all ]] && steps=(prepare install-alma check-alma install-silverblue check-bazzite check-alma
+                                   degraded-alma degraded-bazzite)
 for s in "${steps[@]}"; do
     case $s in
         prepare)            step_prepare ;;
@@ -512,6 +655,8 @@ for s in "${steps[@]}"; do
         install-silverblue) [[ -f $WORK/alma.done ]] || die "run install-alma first"; install silverblue ;;
         check-alma)         (step_check_alma) ;;
         check-bazzite)      (step_check_bazzite) ;;
+        degraded-alma)      (step_degraded alma) ;;
+        degraded-bazzite)   (step_degraded bazzite) ;;
         *) die "unknown step: $s" ;;
     esac
 done

@@ -91,6 +91,10 @@ cat /tmp/part.ks
 %post --interpreter=/bin/bash --erroronfail --log=/root/ks-post.log
 set -euo pipefail
 
+# The udev rule gets into Bazzite's initramfs via rpm-ostree initramfs-etc,
+# which rebase.sh sets up once signed Bazzite is booted.
+@DEGRADED_BOOT@
+
 # /etc, not /usr/local: on ostree /usr/local points into /var, which is not
 # populated yet at install time. /etc is carried across both rebases. The
 # script deletes all of this once Bazzite (signed) is booted.
@@ -104,6 +108,7 @@ cat > /etc/rebase-to-bazzite/rebase.sh <<'SCRIPT'
 # policy needed to verify the second.
 set -euo pipefail
 IMAGE="@BAZZITE_IMAGE@"
+DEGRADED_RULE=/etc/udev/rules.d/65-minipool-degraded.rules
 
 booted_ref=$(rpm-ostree status --booted --json | python3 -c '
 import json, sys
@@ -113,6 +118,19 @@ echo "booted image: $booted_ref"
 
 case $booted_ref in
     "ostree-image-signed:docker://$IMAGE")
+        # Bazzite's initramfs comes prebuilt in the image, so the degraded
+        # boot entry's udev rule is added as an initramfs-etc overlay. It is
+        # kept across updates. Needs its own deployment, so one more reboot.
+        tracked=$(rpm-ostree status --booted --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["deployments"]
+print("\n".join(next(x for x in d if x.get("booted")).get("initramfs-etc", [])))')
+        if ! grep -qxF "$DEGRADED_RULE" <<<"$tracked"; then
+            echo "adding $DEGRADED_RULE to the initramfs"
+            rpm-ostree initramfs-etc --track="$DEGRADED_RULE"
+            shutdown -r +2 "Added the degraded-boot udev rule to the initramfs - rebooting in 2 minutes."
+            exit 0
+        fi
         # Leave what a fresh Bazzite install has: one deployment and none of
         # this. Each step is safe to repeat if a later one fails and the
         # service restarts.

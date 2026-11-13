@@ -145,10 +145,11 @@ jobs:
 
   vm-install:
     # Full unattended install in QEMU/KVM: Alma, Silverblue, the rebase to
-    # Bazzite, then Alma again. See tests/vm-install.sh. Takes 1-2 hours.
+    # Bazzite, Alma again, then each drive dying in turn. See
+    # tests/vm-install.sh. Takes 1.5-2.5 hours.
     runs-on: ubuntu-24.04
     needs: test
-    timeout-minutes: 330
+    timeout-minutes: 360
     concurrency:
       group: vm-install-${{ github.ref }}
       cancel-in-progress: true
@@ -198,6 +199,14 @@ jobs:
 
       - name: Check AlmaLinux still boots
         run: tests/vm-install.sh --work "$VM_WORK" check-alma
+
+      # On throwaway overlays: one SSD dies, the other distro boots its
+      # degraded entry, the pool is rebuilt onto a blank disk.
+      - name: Drive 2 dies, Alma boots degraded, rebuild
+        run: tests/vm-install.sh --work "$VM_WORK" degraded-alma
+
+      - name: Drive 1 dies, Bazzite boots degraded, rebuild
+        run: tests/vm-install.sh --work "$VM_WORK" degraded-bazzite
 
       - uses: actions/upload-artifact@v7
         if: always()

@@ -107,6 +107,7 @@ render() {  # dest-dir
             -e "s|@BAZZITE_IMAGE@|$BAZZITE_IMAGE|g" \
             -e "s|@ALMA_DISK_SERIAL@|$ALMA_DISK_SERIAL|g" \
             -e "s|@BAZZITE_DISK_SERIAL@|$BAZZITE_DISK_SERIAL|g" \
+            -e "/^@DEGRADED_BOOT@\$/{r $HERE/kickstart/degraded-boot.sh" -e 'd' -e '}' \
             "$HERE/kickstart/$ks.ks" > "$out/ventoy/$ks.ks"
         ! grep -q '@[A-Z_]*@' "$out/ventoy/$ks.ks" || die "unfilled placeholder in $ks.ks"
     done
