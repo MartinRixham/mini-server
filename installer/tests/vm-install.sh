@@ -325,8 +325,9 @@ indent() { local l; while IFS= read -r l; do echo "        $l"; done; }
 USR_ETC_SUMS='cd /usr/etc && { find . -type f -exec sha256sum {} + && find . -type l -printf "link:%l  %p\n"; } | sed "s|  \./|  |"'
 
 # /etc files any install rewrites after an update (systemd-sysusers, ldconfig),
+# or rebuilds from /usr at boot (systemd-hwdb-update, bootc-update-ca-trust),
 # so they differ from the image default on a fresh install too.
-ETC_MERGE_ALLOW='^(passwd|group|shadow|gshadow|subuid|subgid)-?$|^ld\.so\.cache$'
+ETC_MERGE_ALLOW='^(passwd|group|shadow|gshadow|subuid|subgid)-?$|^ld\.so\.cache$|^udev/hwdb\.bin$|^pki/ca-trust/extracted/'
 
 check_settled() {
     local state failed
@@ -406,6 +407,42 @@ check_etc_merge() {  # config-diff silverblue-sums bazzite-sums
     CHECK_FAILED=$((before | CHECK_FAILED))
 }
 
+# The policy the kernel loaded must contain Bazzite's own modules (the ones
+# Silverblue doesn't ship): each type they declare must be valid in it. A stale
+# Silverblue-compiled policy kept by the /etc merge would fail this.
+check_selinux_modules() {  # silverblue-sums bazzite-sums
+    local mods out
+    mods=$(comm -13 <(selinux_modules "$1") <(selinux_modules "$2"))
+    if [[ -z $mods ]]; then ok "Bazzite adds no SELinux modules to check"; return; fi
+    # shellcheck disable=SC2016,SC2086  # expands in the guest; one arg per module
+    out=$(vm_ssh bash -s -- $mods <<'EOF'
+for m in "$@"; do
+    f=/usr/etc/selinux/targeted/active/modules/$m/cil
+    if [ "$(head -c3 "$f")" = BZh ]; then src=$(bzcat "$f"); else src=$(cat "$f"); fi
+    types=$(grep -oE '^\(type [^ )]+\)' <<<"$src" | sed 's/^(type //; s/)$//')
+    [ -n "$types" ] || { echo "skip $m"; continue; }
+    for t in $types; do
+        if printf 'system_u:object_r:%s:s0' "$t" > /sys/fs/selinux/context 2>/dev/null
+        then echo "ok $m $t"; else echo "missing $m $t"; fi
+    done
+done
+EOF
+    ) || true
+    local checked; checked=$(grep -c '^ok ' <<<"$out" || true)
+    if grep -q '^missing ' <<<"$out"; then
+        bad "loaded SELinux policy lacks types from Bazzite's modules:"
+        grep '^missing ' <<<"$out" | indent
+    elif [[ $checked -gt 0 ]]; then
+        ok "loaded SELinux policy has Bazzite's modules ($checked types from: $(awk '/^ok /{print $2}' <<<"$out" | sort -u | xargs))"
+    else
+        bad "could not check Bazzite's SELinux modules:"; indent <<<"${out:-no output}"
+    fi
+}
+selinux_modules() {  # sums-file -> "<priority>/<module>" lines
+    awk '$2 ~ /^selinux\/targeted\/active\/modules\/[0-9]+\/[^/]+\/cil$/ {
+        split($2, a, "/"); print a[5] "/" a[6] }' "$1" | sort -u
+}
+
 step_check_bazzite() {
     [[ -f $WORK/silverblue.done ]] || die "run install-silverblue first"
     # shellcheck source=/dev/null
@@ -460,6 +497,7 @@ step_check_bazzite() {
     vm_ssh "$USR_ETC_SUMS" > "$LOGS/bazzite-usr-etc.sums"
     cp "$sb_sums" "$LOGS/"
     check_etc_merge "$LOGS/bazzite-config-diff.txt" "$sb_sums" "$LOGS/bazzite-usr-etc.sums"
+    check_selinux_modules "$sb_sums" "$LOGS/bazzite-usr-etc.sums"
     [[ $CHECK_FAILED == 0 ]] || die "Bazzite differs from a fresh install (see above and $LOGS)"
     info "rebase done; matches a fresh Bazzite install"
     stop
