@@ -1,0 +1,92 @@
+name: installer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # weekly: catches upstream ISO, checksum or Ventoy URL changes
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: installer
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -q && sudo apt-get install -yq shellcheck
+
+      - name: Kickstart %pre tests and shellcheck
+        run: tests/test-kickstarts.sh --out "$RUNNER_TEMP/ks"
+
+      # Each kickstart is validated with its own distro's pykickstart:
+      # AlmaLinux patches the RHEL10 handler to allow btrfs.
+      - name: ksvalidator (AlmaLinux)
+        run: |
+          source config.env
+          docker run --rm -v "$RUNNER_TEMP/ks:/ks:ro" "quay.io/almalinuxorg/almalinux:$ALMA_MAJOR" \
+            sh -c "dnf -yq install pykickstart >/dev/null && ksvalidator -v RHEL$ALMA_MAJOR /ks/alma.ks"
+
+      - name: ksvalidator (Fedora)
+        run: |
+          source config.env
+          docker run --rm -v "$RUNNER_TEMP/ks:/ks:ro" "registry.fedoraproject.org/fedora:$FEDORA_VERSION" \
+            sh -c "dnf -yq install pykickstart >/dev/null && ksvalidator -v F$FEDORA_VERSION /ks/silverblue.ks"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kickstarts
+          path: ${{ runner.temp }}/ks
+          if-no-files-found: ignore
+
+  build:
+    # Builds a real stick image on a loop device: downloads Ventoy and both
+    # ISOs (~2 GB), verifies checksums, installs Ventoy, copies files.
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build stick image
+        run: |
+          truncate -s 8G "$RUNNER_TEMP/usb.img"
+          LOOP=$(sudo losetup -fP --show "$RUNNER_TEMP/usb.img")
+          echo "LOOP=$LOOP" >> "$GITHUB_ENV"
+          # answers: build-usb.sh's "type the device name", then Ventoy's two y/n prompts
+          printf '%s\ny\ny\n' "${LOOP##*/}" | ./build-usb.sh --device "$LOOP" --allow-loop
+
+      - name: Check stick contents
+        run: |
+          source config.env
+          sudo partprobe "$LOOP" && sudo udevadm settle
+          [[ $(sudo blkid -s LABEL -o value "${LOOP}p1") == Ventoy ]]
+          [[ $(sudo blkid -s LABEL -o value "${LOOP}p2") == VTOYEFI ]]
+          mnt=$(mktemp -d)
+          sudo mount -o ro "${LOOP}p1" "$mnt"
+          find "$mnt" -type f -printf '%10s  %P\n' | sort -k2
+          jq . "$mnt/ventoy/ventoy.json"
+          for ks in alma silverblue; do
+            test -s "$mnt/ventoy/$ks.ks"
+            if grep -n '@[A-Z_]*@' "$mnt/ventoy/$ks.ks"; then echo "unfilled placeholder in $ks.ks"; exit 1; fi
+          done
+          grep -q "fedora-silverblue:$FEDORA_VERSION " "$mnt/ventoy/silverblue.ks"
+          # every image ventoy.json refers to is on the stick
+          jq -r '.auto_install[].image, .menu_alias[].image, .auto_install[].template[]' \
+            "$mnt/ventoy/ventoy.json" | while read -r f; do test -s "$mnt$f" || { echo "missing $f"; exit 1; }; done
+          # ISOs match the checksum-verified downloads
+          for iso in "$mnt"/iso/*.iso; do cmp "$iso" ".cache/${iso##*/}"; done
+          sudo umount "$mnt"
+
+      - name: Detach loop device
+        if: always()
+        run: '[[ -z ${LOOP:-} ]] || sudo losetup -d "$LOOP"'

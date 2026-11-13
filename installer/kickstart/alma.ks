@@ -39,9 +39,9 @@ internal_disks() {
     for d in /sys/block/*; do
         d=${d##*/}
         case $d in loop*|ram*|zram*|sr*|dm-*|md*|nbd*|fd*) continue ;; esac
-        [[ $(cat /sys/block/$d/removable) == 0 ]] || continue
-        [[ $(cat /sys/block/$d/size) -gt 0 ]] || continue
-        [[ $(readlink -f /sys/block/$d) == */usb* ]] && continue
+        [[ $(cat /sys/block/"$d"/removable) == 0 ]] || continue
+        [[ $(cat /sys/block/"$d"/size) -gt 0 ]] || continue
+        [[ $(readlink -f /sys/block/"$d") == */usb* ]] && continue
         echo "$d"
     done | sort
 }

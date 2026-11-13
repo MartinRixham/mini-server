@@ -62,6 +62,22 @@ Choose which distro boots using the firmware boot menu, or set the default with
 at the top of the script explains how to build a stick image without a real USB stick.
 Use an x86 machine with KVM; emulated on ARM it's very slow.
 
+## Tests and CI
+
+`tests/test-kickstarts.sh` runs offline. It runs each kickstart's `%pre` against
+fake disks and checks the partitioning it generates, or that it refuses when it
+should. It also shellchecks every script. It needs only bash and shellcheck.
+
+`.github/workflows/installer.yml` runs on every push, every PR and once a week:
+- **test** runs the script above, then validates both full kickstarts with
+  `ksvalidator`. Each is checked in its own distro's container: AlmaLinux ships a
+  pykickstart that allows btrfs, while upstream's RHEL10 profile rejects it.
+- **build** builds a real stick image on a loop device with `build-usb.sh`
+  (downloads Ventoy and both ISOs and verifies their checksums), then checks what
+  ended up on the stick. The weekly run catches upstream URL or ISO changes.
+
+Neither job installs anything. Run `test-vm.sh` for that.
+
 ## Known risks / unverified
 
 - **Step 2's partitioning is the least-tested part.** Anaconda has to add a subvolume

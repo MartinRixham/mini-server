@@ -51,6 +51,7 @@ if [[ $(uname -m) == x86_64 && -w /dev/kvm ]]; then
     ACCEL=(-accel kvm -cpu host)
 else
     echo "warning: no KVM for x86_64 here - using slow emulation" >&2
+    # shellcheck disable=SC2054  # the comma is part of the -accel value
     ACCEL=(-accel tcg,thread=multi -cpu max)
 fi
 
