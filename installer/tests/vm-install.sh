@@ -349,8 +349,10 @@ USR_ETC_SUMS='cd /usr/etc && { find . -type f -exec sha256sum {} + && find . -ty
 
 # /etc files any install rewrites after an update (systemd-sysusers, ldconfig),
 # or rebuilds from /usr at boot (systemd-hwdb-update, bootc-update-ca-trust),
-# so they differ from the image default on a fresh install too.
-ETC_MERGE_ALLOW='^(passwd|group|shadow|gshadow|subuid|subgid)-?$|^ld\.so\.cache$|^udev/hwdb\.bin$|^pki/ca-trust/extracted/'
+# or ostree recompiles on every new deployment (semodule -N --refresh, the
+# compiled SELinux policy), so they differ from the image default on a fresh
+# install too. check_selinux_modules checks the loaded policy itself.
+ETC_MERGE_ALLOW='^(passwd|group|shadow|gshadow|subuid|subgid)-?$|^ld\.so\.cache$|^udev/hwdb\.bin$|^pki/ca-trust/extracted/|^selinux/[^/]+/(active/commit_num|active/policy\.kern|policy/policy\.[0-9]+)$'
 
 check_settled() {
     local state failed

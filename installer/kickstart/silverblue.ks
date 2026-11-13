@@ -150,27 +150,6 @@ print("\n".join(next(x for x in d if x.get("booted")).get("initramfs-etc", [])))
         target="ostree-unverified-registry:$IMAGE" ;;
 esac
 
-# The rebase 3-way merges /etc, so a policy that was recompiled locally (with
-# no customisations, e.g. at install or first boot) is kept over the new
-# image's, and the new image's extra modules never get loaded. If only the
-# compiled output changed, put the image default back so that the merge takes
-# the new image's policy. Real customisations are kept as they are.
-reset_selinux_policy() {
-    local changed compiled other p
-    changed=$(ostree admin config-diff | awk '$2 ~ /^selinux\// {print $1, $2}')
-    [[ -n $changed ]] || return 0
-    echo "local SELinux changes:"; echo "$changed"
-    compiled='^[MD] selinux/[^/]+/(active/commit_num|active/policy\.kern|policy/policy\.[0-9]+)$'
-    other=$(grep -Ev "$compiled" <<<"$changed" || true)
-    if [[ -n $other ]]; then
-        echo "SELinux has local customisations - leaving /etc/selinux alone"
-        return 0
-    fi
-    while read -r _ p; do cp -a "/usr/etc/$p" "/etc/$p"; done <<<"$changed"
-    echo "reset the compiled SELinux policy to the image default"
-}
-reset_selinux_policy
-
 echo "rebasing to $target"
 rpm-ostree rebase "$target"
 shutdown -r +2 "Rebased to Bazzite ($target) - rebooting in 2 minutes."
