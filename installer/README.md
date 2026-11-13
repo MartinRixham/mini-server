@@ -89,6 +89,11 @@ should. It also shellchecks every script. It needs only bash and shellcheck.
   text mode, language, keyboard, timezone, a throwaway root password, an SSH key and
   poweroff. Disk serials are pinned. On an x86 machine with KVM you can run it
   yourself: `tests/vm-install.sh all`.
+- **release** runs on `main` (not PRs) after both build and vm-install pass. It replaces
+  the rolling [`usb-latest`](https://github.com/martinrixham/mini-server/releases/tag/usb-latest)
+  release with the xz-compressed stick image built from `config.env`, its `SHA256SUMS`,
+  and the `dd` command to write it. You can download that instead of running `build-usb.sh`,
+  but the disk serials in it are the ones committed in `config.env`.
 
 ## Known risks / unverified
 

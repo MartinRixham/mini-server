@@ -92,6 +92,57 @@ jobs:
         if: always()
         run: '[[ -z ${LOOP:-} ]] || sudo losetup -d "$LOOP"'
 
+      # The release job publishes this once vm-install has passed.
+      - name: Compress image and write release notes
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          source config.env
+          dist=$RUNNER_TEMP/dist && mkdir -p "$dist"
+          xz -T0 -6 -c "$RUNNER_TEMP/usb.img" > "$dist/mini-server-usb.img.xz"
+          rm "$RUNNER_TEMP/usb.img"
+          # GitHub release assets are limited to 2 GiB each
+          if (( $(stat -c %s "$dist/mini-server-usb.img.xz") > 2000 * 1024 * 1024 )); then
+            split -b 1900M -d -a 1 "$dist/mini-server-usb.img.xz" "$dist/mini-server-usb.img.xz.part"
+            rm "$dist/mini-server-usb.img.xz"
+            write="cat mini-server-usb.img.xz.part* | xz -dc | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress"
+          else
+            write="xz -dc mini-server-usb.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress"
+          fi
+          (cd "$dist" && sha256sum mini-server-usb.img.xz* > SHA256SUMS)
+          serials="not pinned: Alma goes on the first internal disk in kernel name order"
+          [[ -z $ALMA_DISK_SERIAL ]] || serials="Alma \`$ALMA_DISK_SERIAL\`, Bazzite \`$BAZZITE_DISK_SERIAL\`"
+          isos=$(cd .cache && ls *.iso | sed 's/.*/`&`/' | paste -sd, | sed 's/,/, /g')
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Ready-to-write installer stick image (8 GB), built from ${GITHUB_SHA::7} and tested by the full VM install.
+
+          Write it to a stick of 8 GB or more (this **erases** the stick):
+
+          \`\`\`
+          sha256sum -c SHA256SUMS
+          $write
+          \`\`\`
+
+          | | |
+          |---|---|
+          | ISOs | $isos |
+          | Ventoy | $VENTOY_VERSION |
+          | Bazzite image | \`$BAZZITE_IMAGE\` (Fedora $FEDORA_VERSION) |
+          | Disk serials | $serials |
+
+          To change any of these, edit \`installer/config.env\` and build your own stick with \`build-usb.sh\`.
+          EOF
+          mv "$RUNNER_TEMP/notes.md" "$dist/"
+          ls -l "$dist"
+
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          name: usb-image
+          path: ${{ runner.temp }}/dist
+          compression-level: 0
+          retention-days: 3
+          if-no-files-found: error
+
   vm-install:
     # Full unattended install in QEMU/KVM: Alma, Silverblue, the rebase to
     # Bazzite, then Alma again. See tests/vm-install.sh. Takes 1-2 hours.
@@ -154,3 +205,38 @@ jobs:
           name: vm-install-logs
           path: ${{ env.VM_WORK }}/logs
           if-no-files-found: ignore
+
+  release:
+    # Replaces the rolling "usb-latest" release with the image from build,
+    # but only once the full VM install has passed.
+    needs: [build, vm-install]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-usb-latest
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: usb-image
+          path: dist
+
+      - name: Publish release
+        run: |
+          mv dist/notes.md notes.md
+          if gh release view usb-latest >/dev/null 2>&1; then
+            gh release delete usb-latest --cleanup-tag --yes
+          fi
+          gh release create usb-latest dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Installer stick $(date -u +%F) (${GITHUB_SHA::7})" \
+            --notes-file notes.md \
+            --latest
