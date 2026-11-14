@@ -503,6 +503,12 @@ PART=$(part_of "$NEW" "$PARTNO")
 [[ -b $PART ]] || die "$PART did not appear after partitioning"
 
 btrfs replace start "$DEVID" "$PART" "$POOL"
+# Without -B, replace start forks and returns before the child has made the
+# ioctl, so a status check straight away can still say "Never started".
+for _ in $(seq 60); do
+    btrfs replace status -1 "$POOL" 2>/dev/null | grep -q 'Never started' || break
+    sleep 1
+done
 wait_replace
 show
 finish noask
