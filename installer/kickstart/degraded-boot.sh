@@ -259,7 +259,8 @@ rebuild_alma_boot() {  # disk
     pool_uuid=$(show | awk '/uuid:/ {print $NF; exit}')
     step "rebuilding AlmaLinux's ESP ($esp) and /boot ($boot)"
     # Everything but mount and chroot uses AlmaLinux's own tools, from @alma.
-    A=$(mktemp -d /var/tmp/minipool-alma.XXXXXX)    trap cleanup_alma EXIT
+    A=$(mktemp -d /var/tmp/minipool-alma.XXXXXX)   # not under /run: a tmpfs covers it inside
+    trap cleanup_alma EXIT
     mount -o subvol=@alma "UUID=$pool_uuid" "$A"
     for m in dev proc sys; do mount --rbind "/$m" "$A/$m"; mount --make-rslave "$A/$m"; done
     # Not this system's /run: Bazzite's has /run/ostree-booted, which makes Alma's dnf
