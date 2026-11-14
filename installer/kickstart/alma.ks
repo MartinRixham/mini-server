@@ -23,6 +23,8 @@ services --enabled=rasdaemon
 %packages
 @^graphical-server-environment
 btrfs-progs
+# mkfs.vfat, for minipool-rebuild to remake the ESP
+dosfstools
 -mcelog
 rasdaemon
 %end

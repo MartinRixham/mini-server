@@ -240,36 +240,44 @@ alma_boot_ok() {  # disk: ESP and /boot have AlmaLinux's bootloader, and firmwar
     [[ $ok == 1 ]]
 }
 
+# Globals, not locals of rebuild_alma_boot: its EXIT trap runs cleanup_alma after
+# set -e has unwound the function, when its locals are gone.
+A="" RESOLV_SAVED="" RESOLV_COPIED=""
+cleanup_alma() {
+    [[ -n $A ]] || return 0
+    if [[ -n $RESOLV_SAVED ]]; then mv -f "$RESOLV_SAVED" "$A/etc/resolv.conf"
+    elif [[ -n $RESOLV_COPIED ]]; then rm -f "$A/etc/resolv.conf"; fi
+    umount -R "$A" 2>/dev/null || true
+    rmdir "$A" 2>/dev/null || true
+    A="" RESOLV_SAVED="" RESOLV_COPIED=""
+}
+
 rebuild_alma_boot() {  # disk
-    local d=$1 esp boot A pool_uuid resolv_saved="" resolv_copied=""
+    local d=$1 esp boot pool_uuid
     esp=$(part_of "$d" 1) boot=$(part_of "$d" 2)
     [[ $(lsblk -no PARTTYPE "$esp") == "$ESP_GUID" ]] || die "$esp is not an EFI system partition"
     pool_uuid=$(show | awk '/uuid:/ {print $NF; exit}')
     step "rebuilding AlmaLinux's ESP ($esp) and /boot ($boot)"
     # Everything but mount and chroot uses AlmaLinux's own tools, from @alma.
     A=$(mktemp -d /var/tmp/minipool-alma.XXXXXX)   # not under /run: that is bound inside
-    cleanup_alma() {
-        if [[ -n $resolv_saved ]]; then mv -f "$resolv_saved" "$A/etc/resolv.conf"
-        elif [[ -n $resolv_copied ]]; then rm -f "$A/etc/resolv.conf"; fi
-        umount -R "$A" 2>/dev/null || true
-        rmdir "$A" 2>/dev/null || true
-    }
     trap cleanup_alma EXIT
     mount -o subvol=@alma "UUID=$pool_uuid" "$A"
     for m in dev proc sys run; do mount --rbind "/$m" "$A/$m"; mount --make-rslave "$A/$m"; done
+    # dnf in the chroot resolves names with this system's resolver; put Alma's back after.
+    if [[ -e $A/etc/resolv.conf || -L $A/etc/resolv.conf ]]; then
+        RESOLV_SAVED=$A/etc/resolv.conf.minipool-rebuild
+        mv "$A/etc/resolv.conf" "$RESOLV_SAVED"
+    fi
+    cp -L /etc/resolv.conf "$A/etc/resolv.conf"
+    RESOLV_COPIED=1
+    # Anaconda formats the ESP with its own dosfstools, so Alma may not have them.
+    chroot "$A" /bin/sh -c 'command -v mkfs.vfat >/dev/null || dnf -y install dosfstools'
     chroot "$A" mkfs.vfat -F 32 "$esp"
     chroot "$A" mkfs.ext4 -q -F "$boot"
     udevadm settle
     mount "$boot" "$A/boot"
     mkdir -p "$A/boot/efi"
     mount "$esp" "$A/boot/efi"
-    # dnf in the chroot resolves names with this system's resolver; put Alma's back after.
-    if [[ -e $A/etc/resolv.conf || -L $A/etc/resolv.conf ]]; then
-        resolv_saved=$A/etc/resolv.conf.minipool-rebuild
-        mv "$A/etc/resolv.conf" "$resolv_saved"
-    fi
-    cp -L /etc/resolv.conf "$A/etc/resolv.conf"
-    resolv_copied=1
 
     chroot "$A" /usr/bin/env -i PATH=/usr/sbin:/usr/bin HOME=/root LANG=C.UTF-8 \
         ESP="$esp" BOOT="$boot" POOL_UUID="$pool_uuid" EFIARCH="$EFIARCH" DISK="$d" \
