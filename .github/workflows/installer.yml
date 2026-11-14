@@ -162,7 +162,14 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          test -w /dev/kvm
+          sudo udevadm settle
+          if ! test -w /dev/kvm; then
+            echo "::error::/dev/kvm is not usable on this runner"
+            ls -l /dev/kvm || true
+            grep -c -E 'vmx|svm' /proc/cpuinfo || echo "no vmx/svm CPU flags"
+            lsmod | grep kvm || echo "no kvm modules loaded"
+            exit 1
+          fi
 
       - name: Install QEMU
         run: |
