@@ -63,12 +63,13 @@ Neither system loses any files, because every subvolume has a copy on each SSD.
 What you do lose is the dead drive's boot partitions. Alma's are on drive 1 and
 Bazzite's are on drive 2, so the distro on the other drive keeps working:
 
-| Dead drive | Still boots (degraded) | Needs its boot partitions rebuilt |
+| Dead drive | Still boots (degraded) | Gets its boot back |
 |---|---|---|
-| drive 1 | Bazzite | AlmaLinux |
-| drive 2 | AlmaLinux | Bazzite |
+| drive 1 | Bazzite | AlmaLinux: `minipool-rebuild` rebuilds its ESP and `/boot` |
+| drive 2 | AlmaLinux | Bazzite: reinstall it (step 3) |
 
-CI rehearses steps 1 and 2 below for each drive. Step 3 is untested.
+CI rehearses steps 1 and 2 below for each drive, including booting AlmaLinux
+again after drive 1 is rebuilt. Step 3 is untested.
 
 ### 1. Boot with one SSD missing
 
@@ -110,6 +111,13 @@ degraded RAID1 again (`btrfs balance`) and checks every copy (`btrfs scrub`).
 The copy takes a while. If you lose the session, the copy carries on in the
 kernel: run `minipool-rebuild` again to follow it and finish the rest.
 
+If drive 1 died (you're on Bazzite), it then also rebuilds AlmaLinux's ESP and
+`/boot` on the new SSD. It reinstalls the bootloader from AlmaLinux's repos,
+which needs the network, and the kernels from `@alma`. Then it adds AlmaLinux's
+firmware boot entry. AlmaLinux keeps everything it had. Its first boot
+relabels files for SELinux and reboots once by itself. If you were offline, it
+says so: connect and run `minipool-rebuild` again.
+
 It stops without changing anything when it can't tell which disk is the new
 one:
 
@@ -118,17 +126,15 @@ one:
 - **More than one blank disk.** Pick one: `sudo minipool-rebuild --disk /dev/nvme1n1`.
 - **The disk holds part of the pool.** That's the old SSD. Don't reuse it.
 
-Reboot. The surviving distro now boots normally from its usual entry.
+Reboot. The surviving distro now boots normally from its usual entry. If drive
+1 died, you're done.
 
-### 3. Get the other distro booting again
+### 3. Get Bazzite booting again (drive 2 died)
 
-This step is untested. The pool is whole again, but the dead drive's ESP and
-`/boot` are gone.
-
-**Bazzite (drive 2 died): reinstall it with Step 2 of the installer.** Its
-system is an image, so the only thing worth keeping is the home folders. Get
-them out from Alma first, then remove the old subvolume, since Step 2 creates a
-new one:
+This step is untested. The pool is whole again, but Bazzite's ESP and `/boot`
+went with drive 2. Reinstall it with Step 2 of the installer. Its system is an
+image, so the only thing worth keeping is the home folders. Get them out from
+Alma first, then remove the old subvolume, since Step 2 creates a new one:
 
 ```bash
 mount -o subvol=/ LABEL=minipool /mnt
@@ -139,43 +145,3 @@ umount /mnt
 
 If `installer/config.env` pins disk serials, set `BAZZITE_DISK_SERIAL` to the
 new SSD's serial and rebuild the stick. Then follow "3. Install Bazzite" above.
-
-**AlmaLinux (drive 1 died): rebuild its boot partitions from Bazzite.** This
-chroots into `@alma` and reinstalls the bootloader and kernels. It needs the
-network. Run it as root on Bazzite, with `NEW` set to the new SSD (e.g.
-`NEW=/dev/nvme0n1`, the disk `minipool-rebuild` partitioned):
-
-```bash
-mkfs.vfat -F 32 ${NEW}p1
-mkfs.ext4 -q ${NEW}p2
-A=/mnt/alma; mkdir -p $A
-mount -o subvol=@alma LABEL=minipool $A
-mount ${NEW}p2 $A/boot && mkdir -p $A/boot/efi && mount ${NEW}p1 $A/boot/efi
-for d in dev proc sys run; do mount --rbind /$d $A/$d && mount --make-rslave $A/$d; done
-cp --remove-destination -L /etc/resolv.conf $A/etc/resolv.conf
-chroot $A env NEW=$NEW /bin/bash <<'EOF'
-set -e
-BOOT_UUID=$(blkid -s UUID -o value ${NEW}p2) ESP_UUID=$(blkid -s UUID -o value ${NEW}p1)
-# point fstab at the new /boot and ESP
-awk -v b="UUID=$BOOT_UUID" -v e="UUID=$ESP_UUID" '$2=="/boot" {$1=b} $2=="/boot/efi" {$1=e} {print}' \
-    /etc/fstab > /etc/fstab.new && mv /etc/fstab.new /etc/fstab
-dnf -y reinstall shim-x64 grub2-efi-x64 grub2-common grub2-tools grub2-tools-minimal
-for k in /lib/modules/*/vmlinuz; do v=${k%/vmlinuz}; kernel-install add "${v##*/}" "$k"; done
-cat > /boot/efi/EFI/almalinux/grub.cfg <<STUB
-search --no-floppy --fs-uuid --set=dev $BOOT_UUID
-set prefix=(\$dev)/grub2
-export \$prefix
-configfile \$prefix/grub.cfg
-STUB
-grub2-editenv - create
-grub2-mkconfig -o /boot/grub2/grub.cfg
-grubby --set-default "$(ls /boot/vmlinuz-* | grep -v rescue | sort -V | tail -1)"
-touch /.autorelabel          # files written from Bazzite get the right SELinux labels on first boot
-EOF
-efibootmgr -c -d $NEW -p 1 -L AlmaLinux -l '\EFI\almalinux\shimx64.efi'
-umount -R $A
-```
-
-Alma's first boot after this relabels the filesystem and reboots once, which
-takes a few minutes. Reinstalling from the stick also works, but Step 1 erases
-both SSDs.

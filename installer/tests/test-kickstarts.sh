@@ -348,8 +348,11 @@ Label: 'minipool'  uuid: 0000
 	devid    2 size $((50 * GIB)) used $((2 * GIB)) path <missing disk> MISSING
 EOF
     printf 'Data, single: total=1.00GiB, used=0.50GiB\nData, RAID1: total=1.00GiB, used=0.50GiB\n' > "$R/df"
+    echo /dev/nvme1n1p3 > "$R/boot-source"; echo nvme1n1 > "$R/parent.nvme1n1p3"
+    echo nvme0n1 > "$R/parent.nvme0n1p3"
     cat > "$R/bin/findmnt" <<EOF
 #!/bin/bash
+[[ " \$* " == *" SOURCE "* ]] && { cat $R/boot-source; exit; }
 awk -v p="\${@: -1}" '\$1 == p {print \$2, \$3, \$4}' $R/mounts
 EOF
     cat > "$R/bin/btrfs" <<EOF
@@ -373,6 +376,7 @@ case \$cols in
     SIZE,MODEL,SERIAL) echo "\$(cat \$D/\$dev/gib)G Test-SSD \$(cat \$D/\$dev/serial)" ;;
     SIZE,RM,TYPE,TRAN) echo "\$(( \$(cat \$D/\$dev/gib) * $GIB )) \$(cat \$D/\$dev/rm) \$(cat \$D/\$dev/type) \$(cat \$D/\$dev/tran)" ;;
     LABEL)             cat \$D/\$dev/labels 2>/dev/null || true ;;
+    PARTTYPE)          [[ \$dev == *p1 ]] && echo $ESP_GUID ;;
     *) echo "lsblk stub: unknown \$*" >&2; exit 1 ;;
 esac
 EOF
@@ -383,6 +387,17 @@ EOF
     # shellcheck disable=SC2016  # expands in the stub
     printf '#!/bin/bash\necho "${@: -1}"\n' > "$R/bin/realpath"
     printf '#!/bin/bash\n' > "$R/bin/udevadm"
+    # mount copies $R/fs/<partition>/ into the mountpoint, if there is one
+    # shellcheck disable=SC2016  # expands in the stubs
+    printf '#!/bin/bash\nd=${@: -2:1}; src=%q/fs/${d##*/}\n[[ -d $src ]] || exit 32\ncp -r "$src/." "${@: -1}"\n' "$R" > "$R/bin/mount"
+    # shellcheck disable=SC2016
+    printf '#!/bin/bash\nrm -rf "${1:?}"/*\n' > "$R/bin/umount"
+    # shellcheck disable=SC2016
+    printf '#!/bin/bash\nd=${@: -1}; cat %q/partuuid.${d##*/} 2>/dev/null || true\n' "$R" > "$R/bin/blkid"
+    printf '#!/bin/bash\ncat %q/efiboot 2>/dev/null || true\n' "$R" > "$R/bin/efibootmgr"
+    printf '#!/bin/bash\n[[ -e %q/online ]]\n' "$R" > "$R/bin/getent"
+    printf '#!/bin/bash\necho "chroot $*" >> %q/log\n' "$R" > "$R/bin/chroot"
+    touch "$R/online"
     chmod +x "$R"/bin/*
 }
 rdisk() {  # name size-GiB serial [type] [tran] [rm]
@@ -457,7 +472,39 @@ untouched "USB disk"
 
 new_server alma
 sed -i 's/<missing disk> MISSING/\/dev\/nvme1n1p1/' "$R/show"; sed -i '/single/d' "$R/df"
-if rebuild yes; then said "whole pool: nothing to do" "nothing to do"; else bad "whole pool: nothing to do"; cat "$R/out"; fi
+if rebuild yes; then said "whole pool: nothing to do" "Nothing to do."; else bad "whole pool: nothing to do"; cat "$R/out"; fi
+
+# Bazzite with the pool whole again: AlmaLinux's boot on drive 1 is checked.
+whole_on_bazzite() {
+    new_server bazzite
+    sed -i 's/<missing disk> MISSING/\/dev\/nvme0n1p3/' "$R/show"; sed -i '/single/d' "$R/df"
+}
+EA=$(case $(uname -m) in aarch64) echo aa64 ;; *) echo x64 ;; esac)   # as the script picks it
+alma_boot_files() {
+    mkdir -p "$R/fs/nvme0n1p1/EFI/almalinux" "$R/fs/nvme0n1p2/grub2" "$R/fs/nvme0n1p2/loader/entries"
+    for f in "shim$EA.efi" "grub$EA.efi" grub.cfg; do echo x > "$R/fs/nvme0n1p1/EFI/almalinux/$f"; done
+    echo x > "$R/fs/nvme0n1p2/grub2/grub.cfg"; echo x > "$R/fs/nvme0n1p2/loader/entries/a.conf"
+    echo 1111-esp > "$R/partuuid.nvme0n1p1"
+    printf 'Boot0001* AlmaLinux\tHD(1,GPT,1111-esp,0x800,0x12c000)/\\EFI\\almalinux\\shim%s.efi\n' "$EA" > "$R/efiboot"
+}
+no_chroot() {  # description
+    if grep -q chroot "$R/log"; then bad "$1: went into the chroot"; else ok "$1: chroot not used"; fi
+}
+whole_on_bazzite; alma_boot_files
+if rebuild yes; then said "Alma's boot in place: nothing to do" "AlmaLinux's boot partitions on /dev/nvme0n1 are in place."
+else bad "Alma's boot in place: nothing to do"; cat "$R/out"; fi
+no_chroot "Alma's boot in place"
+
+whole_on_bazzite; alma_boot_files; : > "$R/efiboot"
+rebuild no || true
+said "no firmware entry: offers to rebuild Alma's boot" "This formats /dev/nvme0n1p1 and /dev/nvme0n1p2"
+said "answering no stops" "stopped, nothing changed"
+no_chroot "answer no"
+
+whole_on_bazzite
+rm "$R/online"
+if rebuild yes; then bad "offline: fails"; else said "offline: asks to connect and rerun" "Connect, then run minipool-rebuild again."; fi
+no_chroot "offline"
 
 new_server alma
 sed -i 's/<missing disk> MISSING/\/dev\/nvme1n1p1/' "$R/show"

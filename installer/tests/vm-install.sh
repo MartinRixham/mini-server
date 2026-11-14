@@ -21,7 +21,9 @@
 #                       boot with one SSD missing (checks the login notice),
 #                       rebuild the pool onto the blank disk with
 #                       minipool-rebuild, boot normally, check raid1
-#   degraded-bazzite    the same with drive 1 dying and Bazzite surviving
+#   degraded-bazzite    the same with drive 1 dying and Bazzite surviving;
+#                       minipool-rebuild also rebuilds Alma's boot, then Alma
+#                       is booted from the new drive and checked like check-alma
 #
 # Differences from a real install (only for unattended running):
 # - the ISOs' kernels are booted directly with inst.ks=, not through Ventoy
@@ -631,6 +633,22 @@ step_degraded() {  # alma|bazzite: the distro whose drive survives
     check_settled
     [[ $CHECK_FAILED == 0 ]] || die "$who after the rebuild failed the checks"
     stop
+
+    if [[ $who == bazzite ]]; then
+        # minipool-rebuild also rebuilt Alma's ESP and /boot on the new drive 1.
+        if grep -q "AlmaLinux boots from drive 1 again" "$LOGS/degraded-$who-rebuild.log"
+        then ok "minipool-rebuild rebuilt AlmaLinux's boot"
+        else bad "minipool-rebuild did not rebuild AlmaLinux's boot"; fi
+        # Its first boot relabels SELinux and reboots once before SSH comes up.
+        boot "$blank" "degraded-$who-4-alma"
+        info "checks (AlmaLinux from the new drive 1)"
+        if vm_ssh test ! -e /.autorelabel; then ok "SELinux relabel done"; else bad "/.autorelabel still there"; fi
+        (ALMA_SERIAL=$blank; guest_check alma) || CHECK_FAILED=1
+        check_pool / healthy
+        check_settled
+        [[ $CHECK_FAILED == 0 ]] || die "AlmaLinux from the new drive 1 failed the checks"
+        stop
+    fi
     rm -rf "$t"
     info "$who survives drive $dead dying, and the pool is raid1 again"
 }

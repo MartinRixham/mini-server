@@ -30,7 +30,9 @@ kickstarts' `%post`:
 
 The same fragment installs `minipool-rebuild` (`/etc/minipool/rebuild`, linked
 into `/usr/local/sbin` by a `tmpfiles.d` entry, because on ostree `/usr/local`
-is in `/var`). It runs step 2 of "If an SSD dies".
+is in `/var`). It runs step 2 of "If an SSD dies". When drive 1 died, that
+includes rebuilding AlmaLinux's ESP and `/boot` from Bazzite, in a chroot into
+`@alma`.
 `minipool-degraded-notice.service` writes a notice to `/run/motd.d` and
 `/run/issue.d` at boot while the pool is missing a member or isn't all RAID1.
 
@@ -109,7 +111,9 @@ should. It also shellchecks every script. It needs only bash and shellcheck.
   each drive "dies" in turn, on throwaway qcow2 overlays of the installed disks.
   The other distro is booted from its degraded entry with a blank disk in the
   dead one's place. It checks the login notice, then rebuilds the pool onto the
-  blank disk with `minipool-rebuild`, which has to pick that disk itself. Finally it boots normally again and checks that every chunk
+  blank disk with `minipool-rebuild`, which has to pick that disk itself. When
+  drive 1 dies, AlmaLinux is then booted from the new disk and checked like a
+  fresh install. Finally it boots normally again and checks that every chunk
   is RAID1. It takes 1.5-2.5 hours. Logs and failure screenshots are uploaded as the `vm-install-logs`
   artifact.
 

@@ -146,9 +146,14 @@ cat > /etc/minipool/rebuild <<'REBUILDSCRIPT'
 # Rebuilds the "minipool" btrfs raid1 pool onto a new SSD after one died, from
 # whichever distro survived: partitions the new SSD like the drive it replaces,
 # copies the pool onto it (btrfs replace), makes everything written while
-# degraded RAID1 again (balance) and checks every copy (scrub). Safe to run
-# again if it was interrupted. It does not make the other distro bootable
-# again; it prints how at the end.
+# degraded RAID1 again (balance) and checks every copy (scrub).
+#
+# Drive 1 died (run on Bazzite): it then also rebuilds AlmaLinux's ESP and
+# /boot on the new SSD - bootloader from AlmaLinux's repos (needs the network),
+# kernels from @alma - and adds its firmware boot entry. Drive 2 died (run on
+# Alma): reinstall Bazzite with Step 2 of the installer afterwards.
+#
+# Safe to run again if it was interrupted, or to retry AlmaLinux's boot later.
 #
 # The new SSD must be blank (no partition table, no filesystem). Without
 # --disk, it must be the only blank internal disk. Asks before erasing it.
@@ -160,7 +165,14 @@ SYS=${MINIPOOL_SYS:-/sys} OS_RELEASE=${MINIPOOL_OS_RELEASE:-/etc/os-release}   #
 
 die()  { echo "minipool-rebuild: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
-usage() { sed -n '2,12s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+confirm() {  # prompt: go on only if the answer is "yes" (prompt shown even when piped)
+    local answer=""
+    printf '%s Type yes to go on: ' "$1"
+    read -r answer || true
+    echo
+    [[ $answer == yes ]] || die "stopped, nothing changed"
+}
+usage() { sed -n '2,/^set -/{/^set -/d;s/^# \{0,1\}//p}' "$0"; exit "${1:-0}"; }
 
 DISK=""
 while [[ $# -gt 0 ]]; do
@@ -193,21 +205,168 @@ missing() { show | grep -i missing >/dev/null; }
 not_raid1() { btrfs filesystem df "$POOL" | grep -E '^(Data|Metadata|System), ' | grep -v ', RAID1:' || true; }
 replace_running() { btrfs replace status -1 "$POOL" 2>/dev/null | grep -q '% done'; }
 
+part_of() { echo "$1$([[ $1 =~ [0-9]$ ]] && echo p)$2"; }   # disk partno -> partition
+
+# --- AlmaLinux's boot partitions (drive 1 died, run on Bazzite) ------------------
+EFIARCH=$(case $(uname -m) in aarch64) echo aa64 ;; *) echo x64 ;; esac)
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+
+drive1() {  # the disk with the pool member that is not on Bazzite's own disk
+    local own dev d
+    own=$(lsblk -no PKNAME "$(findmnt -no SOURCE /boot)")
+    for dev in $(show | awk '$1 == "devid" && $NF ~ "^/dev/" {print $NF}'); do
+        d=$(lsblk -no PKNAME "$dev")
+        [[ $d == "$own" ]] || { echo "/dev/$d"; return 0; }
+    done
+}
+
+alma_boot_ok() {  # disk: ESP and /boot have AlmaLinux's bootloader, and firmware has its entry
+    local esp boot m ok=1 uuid
+    esp=$(part_of "$1" 1) boot=$(part_of "$1" 2)
+    m=$(mktemp -d)
+    if mount -o ro "$esp" "$m" 2>/dev/null; then
+        for f in "shim$EFIARCH.efi" "grub$EFIARCH.efi" grub.cfg; do [[ -s $m/EFI/almalinux/$f ]] || ok=0; done
+        umount "$m"
+    else ok=0; fi
+    if mount -o ro "$boot" "$m" 2>/dev/null; then
+        [[ -s $m/grub2/grub.cfg ]] || ok=0
+        compgen -G "$m/loader/entries/*.conf" >/dev/null || ok=0
+        umount "$m"
+    else ok=0; fi
+    rmdir "$m"
+    uuid=$(blkid -s PARTUUID -o value "$esp" 2>/dev/null || true)
+    if [[ -z $uuid ]] || ! efibootmgr -v 2>/dev/null | grep -i "$uuid" | grep -i "shim$EFIARCH" >/dev/null; then ok=0; fi
+    [[ $ok == 1 ]]
+}
+
+rebuild_alma_boot() {  # disk
+    local d=$1 esp boot A pool_uuid resolv_saved="" resolv_copied=""
+    esp=$(part_of "$d" 1) boot=$(part_of "$d" 2)
+    [[ $(lsblk -no PARTTYPE "$esp") == "$ESP_GUID" ]] || die "$esp is not an EFI system partition"
+    pool_uuid=$(show | awk '/uuid:/ {print $NF; exit}')
+    step "rebuilding AlmaLinux's ESP ($esp) and /boot ($boot)"
+    # Everything but mount and chroot uses AlmaLinux's own tools, from @alma.
+    A=$(mktemp -d /var/tmp/minipool-alma.XXXXXX)   # not under /run: that is bound inside
+    cleanup_alma() {
+        if [[ -n $resolv_saved ]]; then mv -f "$resolv_saved" "$A/etc/resolv.conf"
+        elif [[ -n $resolv_copied ]]; then rm -f "$A/etc/resolv.conf"; fi
+        umount -R "$A" 2>/dev/null || true
+        rmdir "$A" 2>/dev/null || true
+    }
+    trap cleanup_alma EXIT
+    mount -o subvol=@alma "UUID=$pool_uuid" "$A"
+    for m in dev proc sys run; do mount --rbind "/$m" "$A/$m"; mount --make-rslave "$A/$m"; done
+    chroot "$A" mkfs.vfat -F 32 "$esp"
+    chroot "$A" mkfs.ext4 -q -F "$boot"
+    udevadm settle
+    mount "$boot" "$A/boot"
+    mkdir -p "$A/boot/efi"
+    mount "$esp" "$A/boot/efi"
+    # dnf in the chroot resolves names with this system's resolver; put Alma's back after.
+    if [[ -e $A/etc/resolv.conf || -L $A/etc/resolv.conf ]]; then
+        resolv_saved=$A/etc/resolv.conf.minipool-rebuild
+        mv "$A/etc/resolv.conf" "$resolv_saved"
+    fi
+    cp -L /etc/resolv.conf "$A/etc/resolv.conf"
+    resolv_copied=1
+
+    chroot "$A" /usr/bin/env -i PATH=/usr/sbin:/usr/bin HOME=/root LANG=C.UTF-8 \
+        ESP="$esp" BOOT="$boot" POOL_UUID="$pool_uuid" EFIARCH="$EFIARCH" DISK="$d" \
+        /bin/bash -s <<'CHROOT'
+set -euo pipefail
+boot_uuid=$(blkid -s UUID -o value "$BOOT")
+esp_uuid=$(blkid -s UUID -o value "$ESP")
+grep -Eq '^[^#]\S*\s+/boot\s' /etc/fstab && grep -Eq '^[^#]\S*\s+/boot/efi\s' /etc/fstab \
+    || { echo "/etc/fstab has no /boot or /boot/efi line"; exit 1; }
+echo "pointing /etc/fstab at the new /boot (UUID=$boot_uuid) and ESP (UUID=$esp_uuid)"
+awk -v b="UUID=$boot_uuid" -v e="UUID=$esp_uuid" \
+    '$1 !~ /^#/ && $2 == "/boot" {$1 = b} $1 !~ /^#/ && $2 == "/boot/efi" {$1 = e} {print}' \
+    /etc/fstab > /etc/fstab.new
+cat /etc/fstab.new > /etc/fstab   # keeps the file's SELinux label
+rm /etc/fstab.new
+
+# Without this, kernel-install would copy this system's (Bazzite's) command line.
+if [[ ! -s /etc/kernel/cmdline ]]; then
+    GRUB_CMDLINE_LINUX=""
+    # shellcheck source=/dev/null
+    [[ -f /etc/default/grub ]] && . /etc/default/grub
+    mkdir -p /etc/kernel
+    echo "root=UUID=$POOL_UUID ro rootflags=subvol=@alma $GRUB_CMDLINE_LINUX" > /etc/kernel/cmdline
+fi
+echo "kernel command line: $(cat /etc/kernel/cmdline)"
+
+echo "reinstalling the bootloader onto the ESP"
+pkgs=("shim-$EFIARCH" "grub2-efi-$EFIARCH" grub2-common)
+# reinstall needs the installed version in the repos; distro-sync moves to the current one.
+dnf -y reinstall "${pkgs[@]}" || dnf -y distro-sync "${pkgs[@]}"
+for f in "shim$EFIARCH.efi" "grub$EFIARCH.efi"; do
+    [[ -s /boot/efi/EFI/almalinux/$f ]] || { echo "dnf did not put $f on the ESP"; exit 1; }
+done
+cat > /boot/efi/EFI/almalinux/grub.cfg <<STUB
+search --no-floppy --fs-uuid --set=dev $boot_uuid
+set prefix=(\$dev)/grub2
+export \$prefix
+configfile \$prefix/grub.cfg
+STUB
+
+echo "installing the kernels from @alma"
+mkdir -p /boot/loader/entries /boot/grub2
+for k in /usr/lib/modules/*/vmlinuz; do
+    v=${k%/vmlinuz}; v=${v##*/}
+    echo "  $v"
+    kernel-install add "$v" "$k"
+done
+grub2-editenv /boot/grub2/grubenv create
+grub2-mkconfig -o /boot/grub2/grub.cfg
+newest=$(printf '%s\n' /boot/vmlinuz-* | grep -v rescue | sort -V | tail -1)
+grubby --set-default "$newest"
+
+echo "adding the firmware boot entry"
+for n in $(efibootmgr | awk '$0 ~ /^Boot[0-9A-Fa-f]{4}\*? AlmaLinux/ {print substr($1, 5, 4)}'); do
+    efibootmgr -q -b "$n" -B
+done
+efibootmgr -q -c -d "$DISK" -p 1 -L AlmaLinux -l "\\EFI\\almalinux\\shim$EFIARCH.efi"
+efibootmgr
+
+# Files written from here may lack AlmaLinux's SELinux labels: relabel on its first boot.
+touch /.autorelabel
+CHROOT
+    cleanup_alma
+    trap - EXIT
+    ALMA_REBUILT=1
+}
+
+ensure_alma_boot() {  # ask|noask
+    [[ $DEAD == 1 ]] || return 0
+    local d; d=$(drive1)
+    [[ -n $d ]] || die "can't find drive 1 among the pool's members"
+    if alma_boot_ok "$d"; then echo "AlmaLinux's boot partitions on $d are in place."; return 0; fi
+    if ! getent ahosts mirrors.almalinux.org >/dev/null; then
+        echo
+        echo "AlmaLinux's boot partitions on $d still need rebuilding, which needs the"
+        echo "network. Connect, then run minipool-rebuild again."
+        exit 1
+    fi
+    if [[ $1 == ask ]]; then
+        echo "AlmaLinux's ESP and /boot on $d are missing or incomplete."
+        confirm "Rebuild them? This formats $(part_of "$d" 1) and $(part_of "$d" 2)."
+    fi
+    rebuild_alma_boot "$d"
+}
+
 next_steps() {
     echo
     if [[ $DEAD == 1 ]]; then
-        echo "The pool is whole again. AlmaLinux can't boot yet: its ESP and /boot on"
-        echo "${NEW:-the new SSD} are still empty. See \"3. Get the other distro booting again\""
-        echo "in the mini-server README (AlmaLinux, drive 1 died)."
+        echo "The pool is whole again, and AlmaLinux boots from drive 1 again. Its first"
+        echo "boot relabels files for SELinux and reboots once by itself. The firmware now"
+        echo "boots AlmaLinux first; change that with efibootmgr --bootorder."
     else
         echo "The pool is whole again. Bazzite can't boot yet: reinstall it with Step 2"
-        echo "of the installer. See \"3. Get the other distro booting again\" in the"
-        echo "mini-server README (Bazzite, drive 2 died)."
+        echo "of the installer. See \"3. Get Bazzite booting again\" in the mini-server README."
     fi
-    echo "Reboot first: $SURVIVOR now boots from its normal entry."
 }
 
-finish() {  # balance what was written while degraded, then scrub
+finish() {  # ask|noask (for AlmaLinux's boot): balance, scrub, then the other distro
     step "making everything RAID1 again (btrfs balance)"
     btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft "$POOL"
     step "checking every copy (btrfs scrub, can take a while)"
@@ -215,6 +374,7 @@ finish() {  # balance what was written while degraded, then scrub
     btrfs filesystem df "$POOL"
     [[ -z $(not_raid1) ]] || die "some chunks are still not RAID1 - see above"
     /etc/minipool/degraded-notice || true
+    ensure_alma_boot "$1"
     next_steps
 }
 
@@ -233,16 +393,19 @@ show
 
 if replace_running; then
     wait_replace
-    finish
+    finish noask
     exit 0
 fi
 if ! missing; then
     if [[ -n $(not_raid1) ]]; then
         echo "No member is missing, but some chunks are not RAID1:"; not_raid1
-        finish
+        finish ask
         exit 0
     fi
-    echo "The pool is whole and all RAID1 - nothing to do."
+    echo "The pool is whole and all RAID1."
+    ALMA_REBUILT=0
+    ensure_alma_boot ask
+    if [[ $ALMA_REBUILT == 1 ]]; then next_steps; else echo "Nothing to do."; fi
     exit 0
 fi
 
@@ -308,10 +471,12 @@ else
 fi
 
 if [[ $DEAD == 1 ]]; then
-    layout="ESP ${ESP_MIB} MiB, /boot ${BOOT_MIB} MiB (both left empty), pool member ${MIB} MiB"
+    layout="ESP ${ESP_MIB} MiB, /boot ${BOOT_MIB} MiB, pool member ${MIB} MiB"
+    after=", then AlmaLinux's ESP and /boot (needs the network)"
     PARTNO=3
 else
     layout="pool member ${MIB} MiB, the rest left free for Bazzite"
+    after=""
     PARTNO=1
 fi
 cat <<EOF
@@ -319,11 +484,10 @@ cat <<EOF
 The new SSD:     $NEW  ($(describe "$NEW"))
 Surviving SSD:   $KEEP  ($(describe "$KEEP")), not touched
 New layout:      $layout
-Then:            btrfs replace of missing devid $DEVID, balance to RAID1, scrub
+Then:            btrfs replace of missing devid $DEVID, balance to RAID1, scrub$after
 
 EOF
-read -r -p "This ERASES $NEW. Type yes to go on: " answer
-[[ $answer == yes ]] || die "stopped, nothing changed"
+confirm "This ERASES $NEW."
 
 # --- rebuild --------------------------------------------------------------------
 step "partitioning $NEW"
@@ -334,13 +498,13 @@ else
     echo "size=${MIB}MiB, type=linux" | sfdisk --label gpt "$NEW"
 fi
 udevadm settle
-PART=$NEW$([[ $NEW =~ [0-9]$ ]] && echo p)$PARTNO
+PART=$(part_of "$NEW" "$PARTNO")
 [[ -b $PART ]] || die "$PART did not appear after partitioning"
 
 btrfs replace start "$DEVID" "$PART" "$POOL"
 wait_replace
 show
-finish
+finish noask
 REBUILDSCRIPT
 chmod 0755 /etc/minipool/rebuild
 
