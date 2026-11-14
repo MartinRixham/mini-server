@@ -323,8 +323,8 @@ echo "minipool-rebuild"
 awk "/<<'REBUILDSCRIPT'\$/ {on = 1; next} /^REBUILDSCRIPT\$/ {on = 0} on" "$WORK/alma.ks" > "$WORK/minipool-rebuild"
 awk "/<<'NOTICESCRIPT'\$/ {on = 1; next} /^NOTICESCRIPT\$/ {on = 0} on" "$WORK/alma.ks" > "$WORK/degraded-notice"
 chmod +x "$WORK/minipool-rebuild" "$WORK/degraded-notice"
-expect "%post links minipool-rebuild into /usr/local/sbin" \
-    grep -qxF 'L /usr/local/sbin/minipool-rebuild - - - - /etc/minipool/rebuild' "$WORK/alma.ks"
+expect "%post links minipool-rebuild into /usr/local/bin" \
+    grep -qxF 'L /usr/local/bin/minipool-rebuild - - - - /etc/minipool/rebuild' "$WORK/alma.ks"
 
 # A fake server with one SSD gone: stub findmnt/btrfs/lsblk/blockdev/wipefs,
 # with sfdisk and btrfs writes logged. Disks are added with rdisk.

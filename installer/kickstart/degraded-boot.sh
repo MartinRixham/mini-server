@@ -566,6 +566,6 @@ systemctl enable minipool-degraded-notice.service
 
 mkdir -p /etc/tmpfiles.d
 cat > /etc/tmpfiles.d/minipool.conf <<'TMPFILES'
-L /usr/local/sbin/minipool-rebuild - - - - /etc/minipool/rebuild
+L /usr/local/bin/minipool-rebuild - - - - /etc/minipool/rebuild
 TMPFILES
 # ---- end of degraded boot entry ---------------------------------------------

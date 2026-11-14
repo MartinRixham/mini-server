@@ -29,7 +29,7 @@ kickstarts' `%post`:
   time. That overlay is the one way Bazzite differs from a fresh ISO install.
 
 The same fragment installs `minipool-rebuild` (`/etc/minipool/rebuild`, linked
-into `/usr/local/sbin` by a `tmpfiles.d` entry, because on ostree `/usr/local`
+into `/usr/local/bin` by a `tmpfiles.d` entry, because on ostree `/usr/local`
 is in `/var`). It runs step 2 of "If an SSD dies". When drive 1 died, that
 includes rebuilding AlmaLinux's ESP and `/boot` from Bazzite, in a chroot into
 `@alma`.
