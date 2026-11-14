@@ -16,9 +16,15 @@ graphical
 
 %include /tmp/part.ks
 
+# mcelog exits on AMD family 17h and newer, leaving a failed unit; rasdaemon
+# logs machine-check / EDAC errors on both AMD and Intel.
+services --enabled=rasdaemon
+
 %packages
 @^graphical-server-environment
 btrfs-progs
+-mcelog
+rasdaemon
 %end
 
 %pre --interpreter=/bin/bash --log=/tmp/ks-pre.log
