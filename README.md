@@ -74,22 +74,16 @@ again after drive 1 is rebuilt. Step 3 is untested.
 ### 1. Boot with one SSD missing
 
 Put the new SSD in. It must be the same size as the old one or larger. You can
-also leave the slot empty for now. Boot the surviving drive from the firmware
-boot menu and pick **… - one SSD missing (degraded)** in GRUB. If the menu
-flashes past or never shows, hold Shift or tap Esc while it starts.
+also leave the slot empty for now. Connect a monitor and keyboard, since the
+next part happens in menus before the network is up. Boot the surviving drive
+from the firmware boot menu and pick **… - one SSD missing (degraded)** in
+GRUB. If the menu flashes past or never shows, hold Shift or tap Esc while it
+starts.
 
 The normal entry won't boot. It stops at an emergency shell, because a btrfs
 raid1 pool with a member missing only mounts when asked to. The degraded entry
 asks, and it is kept in step with kernel and Bazzite updates. Until step 2 is
 done, everything is written to the one remaining SSD, so don't wait long.
-
-On a headless server you can pick the degraded entry ahead of time, for the
-next boot only. Run this before you shut down to swap a failing SSD:
-
-```bash
-sudo unshare -m sh -c 'test -w /boot/grub2 || mount -o remount,rw /boot
-    grub2-editenv - set minipool_boot_once=degraded'
-```
 
 Don't put the dead SSD back in later. Its copy of the pool is out of date.
 

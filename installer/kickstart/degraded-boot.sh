@@ -31,7 +31,8 @@ cat > /etc/minipool/degraded-boot-entry <<'ENTRYSCRIPT'
 # Writes /boot/grub2/custom.cfg with a "one SSD missing (degraded)" menu entry:
 # the default boot entry with ",degraded" added to rootflags=. Run at boot and
 # at shutdown (after ostree has written a staged update's entries) by
-# minipool-degraded-boot.service. To pick the entry for the next boot only:
+# minipool-degraded-boot.service. To pick the entry for the next boot only
+# (tests/vm-install.sh does, as no one is at the VM's console):
 #   grub2-editenv - set minipool_boot_once=degraded
 set -euo pipefail
 shopt -s nullglob

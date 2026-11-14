@@ -543,7 +543,8 @@ step_check_bazzite() {
 }
 
 # --- one SSD dies ----------------------------------------------------------------
-# Next boot only: the degraded entry (README.md has the same command).
+# Next boot only: the degraded entry. A person picks it in the GRUB menu;
+# the VM has no one at the console, so it sets the one-shot flag instead.
 # shellcheck disable=SC2016  # expands in the guest
 BOOT_DEGRADED_ONCE='unshare -m sh -c "test -w /boot/grub2 || mount -o remount,rw /boot
     test -e /boot/grub2/grubenv || grub2-editenv - create
