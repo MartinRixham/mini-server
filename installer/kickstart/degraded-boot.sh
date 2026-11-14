@@ -270,10 +270,13 @@ rebuild_alma_boot() {  # disk
     fi
     cp -L /etc/resolv.conf "$A/etc/resolv.conf"
     RESOLV_COPIED=1
+    # Alma's own PATH, not this system's: Bazzite's has no /usr/sbin (Fedora merged it
+    # into /usr/bin), but Alma keeps mkfs.* there.
+    in_alma() { chroot "$A" /usr/bin/env -i PATH=/usr/sbin:/usr/bin HOME=/root LANG=C.UTF-8 "$@"; }
     # Anaconda formats the ESP with its own dosfstools, so Alma may not have them.
-    chroot "$A" /bin/sh -c 'command -v mkfs.vfat >/dev/null || dnf -y install dosfstools'
-    chroot "$A" mkfs.vfat -F 32 "$esp"
-    chroot "$A" mkfs.ext4 -q -F "$boot"
+    in_alma /bin/sh -c 'command -v mkfs.vfat >/dev/null || dnf -y install dosfstools'
+    in_alma mkfs.vfat -F 32 "$esp"
+    in_alma mkfs.ext4 -q -F "$boot"
     udevadm settle
     mount "$boot" "$A/boot"
     mkdir -p "$A/boot/efi"
