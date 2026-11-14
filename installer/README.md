@@ -28,6 +28,12 @@ kickstarts' `%post`:
   service adds the rule with `rpm-ostree initramfs-etc` and reboots one more
   time. That overlay is the one way Bazzite differs from a fresh ISO install.
 
+The same fragment installs `minipool-rebuild` (`/etc/minipool/rebuild`, linked
+into `/usr/local/sbin` by a `tmpfiles.d` entry, because on ostree `/usr/local`
+is in `/var`). It runs step 2 of "If an SSD dies".
+`minipool-degraded-notice.service` writes a notice to `/run/motd.d` and
+`/run/issue.d` at boot while the pool is missing a member or isn't all RAID1.
+
 Each step is the distro's own graphical installer. A kickstart fills in the disk
 layout and software, and leaves you to fill in language, keyboard, **network/WiFi**,
 hostname, timezone, root password and user account.
@@ -102,8 +108,8 @@ should. It also shellchecks every script. It needs only bash and shellcheck.
   each `/boot` is on, and that Alma still boots after Bazzite is installed. Then
   each drive "dies" in turn, on throwaway qcow2 overlays of the installed disks.
   The other distro is booted from its degraded entry with a blank disk in the
-  dead one's place. The pool is rebuilt onto the blank disk with the commands in
-  the main README. Finally it boots normally again and checks that every chunk
+  dead one's place. It checks the login notice, then rebuilds the pool onto the
+  blank disk with `minipool-rebuild`, which has to pick that disk itself. Finally it boots normally again and checks that every chunk
   is RAID1. It takes 1.5-2.5 hours. Logs and failure screenshots are uploaded as the `vm-install-logs`
   artifact.
 

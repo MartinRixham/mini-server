@@ -220,7 +220,7 @@ echo "degraded-boot-entry"
 for ks in alma silverblue; do
     render "$ks" "" "" > "$WORK/$ks.ks"
     if grep -q '@[A-Z_]*@' "$WORK/$ks.ks"; then bad "$ks.ks: unfilled placeholder"; grep -n '@[A-Z_]*@' "$WORK/$ks.ks"
-    elif ! section "$WORK/$ks.ks" %post | grep -q 'systemctl enable minipool-degraded-boot.service'; then
+    elif ! section "$WORK/$ks.ks" %post | grep 'systemctl enable minipool-degraded-boot.service' >/dev/null; then
         bad "$ks.ks: %post does not set up the degraded boot entry"
     else ok "$ks.ks %post sets up the degraded boot entry"; fi
 done
@@ -318,6 +318,164 @@ else bad "leaves a custom.cfg it did not write alone"; fi
 new_boot
 if run_entry; then bad "fails without boot entries"; else ok "fails without boot entries"; fi
 
+# --- minipool-rebuild ------------------------------------------------------------
+echo "minipool-rebuild"
+awk "/<<'REBUILDSCRIPT'\$/ {on = 1; next} /^REBUILDSCRIPT\$/ {on = 0} on" "$WORK/alma.ks" > "$WORK/minipool-rebuild"
+awk "/<<'NOTICESCRIPT'\$/ {on = 1; next} /^NOTICESCRIPT\$/ {on = 0} on" "$WORK/alma.ks" > "$WORK/degraded-notice"
+chmod +x "$WORK/minipool-rebuild" "$WORK/degraded-notice"
+expect "%post links minipool-rebuild into /usr/local/sbin" \
+    grep -qxF 'L /usr/local/sbin/minipool-rebuild - - - - /etc/minipool/rebuild' "$WORK/alma.ks"
+
+# A fake server with one SSD gone: stub findmnt/btrfs/lsblk/blockdev/wipefs,
+# with sfdisk and btrfs writes logged. Disks are added with rdisk.
+GIB=1073741824
+new_server() {  # alma|bazzite
+    R="$WORK/server.$RANDOM"
+    mkdir -p "$R/bin" "$R/disks" "$R/sys/class/block"
+    : > "$R/log"
+    local keep member part pool
+    if [[ $1 == alma ]]; then keep=nvme0n1 part=3 pool=/;    echo ID=almalinux > "$R/os-release"
+    else                      keep=nvme1n1 part=1 pool=/var; echo ID=bazzite > "$R/os-release"; fi
+    member=${keep}p$part
+    echo "$pool btrfs minipool rw,relatime" > "$R/mounts"
+    mkdir -p "$R/sys/class/block/$member"; echo "$part" > "$R/sys/class/block/$member/partition"
+    rdisk "$keep" 100 SSD-KEEP; echo "$member" >> "$R/disks/$keep/children"; echo minipool > "$R/disks/$keep/labels"
+    echo "$keep" > "$R/parent.$member"
+    cat > "$R/show" <<EOF
+Label: 'minipool'  uuid: 0000
+	Total devices 2 FS bytes used 1.00GiB
+	devid    1 size $((50 * GIB)) used $((2 * GIB)) path /dev/$member
+	devid    2 size $((50 * GIB)) used $((2 * GIB)) path <missing disk> MISSING
+EOF
+    printf 'Data, single: total=1.00GiB, used=0.50GiB\nData, RAID1: total=1.00GiB, used=0.50GiB\n' > "$R/df"
+    cat > "$R/bin/findmnt" <<EOF
+#!/bin/bash
+awk -v p="\${@: -1}" '\$1 == p {print \$2, \$3, \$4}' $R/mounts
+EOF
+    cat > "$R/bin/btrfs" <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+    "filesystem show") cat $R/show ;;
+    "filesystem df")   cat $R/df ;;
+    "replace status")  echo "Never started" ;;
+    *) echo "btrfs \$*" >> $R/log ;;
+esac
+EOF
+    cat > "$R/bin/lsblk" <<EOF
+#!/bin/bash
+D=$R/disks
+cols="" dev=""
+for a in "\$@"; do case \$a in -*) ;; *) if [[ -z \$cols ]]; then cols=\$a; else dev=\${a#/dev/}; fi ;; esac; done
+case \$cols in
+    PKNAME)            cat $R/parent.\$dev ;;
+    NAME)              if [[ -z \$dev ]]; then for d in \$D/*; do echo /dev/\${d##*/}; done
+                       else echo \$dev; cat \$D/\$dev/children 2>/dev/null; fi ;;
+    SIZE,MODEL,SERIAL) echo "\$(cat \$D/\$dev/gib)G Test-SSD \$(cat \$D/\$dev/serial)" ;;
+    SIZE,RM,TYPE,TRAN) echo "\$(( \$(cat \$D/\$dev/gib) * $GIB )) \$(cat \$D/\$dev/rm) \$(cat \$D/\$dev/type) \$(cat \$D/\$dev/tran)" ;;
+    LABEL)             cat \$D/\$dev/labels 2>/dev/null || true ;;
+    *) echo "lsblk stub: unknown \$*" >&2; exit 1 ;;
+esac
+EOF
+    printf '#!/bin/bash\necho %s\n' "$((50 * GIB))" > "$R/bin/blockdev"
+    # shellcheck disable=SC2016  # expands in the stub
+    printf '#!/bin/bash\ncat %q/disks/${2#/dev/}/sigs 2>/dev/null || true\n' "$R" > "$R/bin/wipefs"
+    printf '#!/bin/bash\n{ echo "sfdisk $*"; cat; } >> %q/log\n' "$R" > "$R/bin/sfdisk"
+    # shellcheck disable=SC2016  # expands in the stub
+    printf '#!/bin/bash\necho "${@: -1}"\n' > "$R/bin/realpath"
+    printf '#!/bin/bash\n' > "$R/bin/udevadm"
+    chmod +x "$R"/bin/*
+}
+rdisk() {  # name size-GiB serial [type] [tran] [rm]
+    mkdir -p "$R/disks/$1"
+    echo "$2" > "$R/disks/$1/gib"; echo "$3" > "$R/disks/$1/serial"
+    echo "${4:-disk}" > "$R/disks/$1/type"; echo "${5:-nvme}" > "$R/disks/$1/tran"; echo "${6:-0}" > "$R/disks/$1/rm"
+}
+rebuild() {  # answer, then args
+    local answer=$1; shift
+    echo "$answer" | PATH="$R/bin:$PATH" MINIPOOL_SYS=$R/sys MINIPOOL_OS_RELEASE=$R/os-release \
+        "$WORK/minipool-rebuild" "$@" > "$R/out" 2>&1
+}
+said() {  # description fixed-string
+    if grep -qF -- "$2" "$R/out"; then ok "$1"; else bad "$1 (no '$2')"; sed 's/^/    /' "$R/out"; fi
+}
+untouched() {  # description
+    if grep -q sfdisk "$R/log"; then bad "$1: partitioned a disk"; else ok "$1: no disk touched"; fi
+}
+
+new_server alma
+rdisk nvme1n1 100 SSD-NEW; rdisk sda 32 STICK disk usb 1; rdisk zram0 8 "" disk ""
+if rebuild no; then bad "answering no fails"; else ok "answering no fails"; fi
+said "Alma: the one blank internal disk is picked" "The new SSD:     /dev/nvme1n1"
+said "Alma: rebuilds drive 2" "running AlmaLinux, so drive 2 is the one to rebuild"
+said "says which devid it replaces" "btrfs replace of missing devid 2"
+untouched "answer no"
+rebuild yes || true
+if grep -qxF "size=51200MiB, type=linux" "$R/log" && grep -qF "sfdisk --label gpt /dev/nvme1n1" "$R/log"; then
+    ok "drive 2: one pool member partition the size of the survivor"
+else bad "drive 2 partitioning"; cat "$R/log"; fi
+
+new_server bazzite
+rdisk nvme0n1 100 SSD-NEW
+rebuild yes || true
+said "Bazzite: pool at /var, rebuilds drive 1" "mounted at /var; running Bazzite, so drive 1 is the one to rebuild"
+if [[ $(grep -A3 'sfdisk --label gpt /dev/nvme0n1' "$R/log" | tail -3) == $'size=600MiB, type=uefi\nsize=2048MiB, type=linux\nsize=51200MiB, type=linux' ]]; then
+    ok "drive 1: ESP, /boot and pool member"
+else bad "drive 1 partitioning"; cat "$R/log"; fi
+
+new_server alma
+rdisk nvme1n1 100 SSD-A; rdisk nvme2n1 100 SSD-B
+if rebuild yes; then bad "two blank disks: refuses"; else said "two blank disks: refuses" "pick one with --disk"; fi
+untouched "two blank disks"
+rebuild no --disk /dev/nvme2n1 || true
+said "--disk picks one of them" "The new SSD:     /dev/nvme2n1"
+
+new_server alma
+rdisk nvme1n1 100 SSD-OLD; echo minipool > "$R/disks/nvme1n1/labels"; echo nvme1n1p1 > "$R/disks/nvme1n1/children"
+if rebuild yes; then bad "old SSD put back: refuses"; else said "old SSD put back: refuses" "the old SSD? Don't reuse it"; fi
+untouched "old SSD"
+rebuild yes --disk /dev/nvme1n1 || true
+said "old SSD refused with --disk too" "/dev/nvme1n1 can't be the new SSD"
+untouched "old SSD with --disk"
+
+new_server alma
+rdisk nvme1n1 100 SSD-USED; echo "0x438 btrfs" > "$R/disks/nvme1n1/sigs"
+rebuild yes || true
+said "a disk with a filesystem is not blank" "not blank (wipe it with 'wipefs -a /dev/nvme1n1'"
+untouched "not blank"
+
+new_server alma
+rdisk nvme1n1 52 SSD-SMALL
+rebuild yes || true
+said "too small for the pool member plus ESP and /boot" "too small (53248 MiB, needs 53864)"
+untouched "too small"
+
+new_server alma
+rdisk sda 200 USB-DISK disk usb 0
+rebuild yes || true
+said "USB disks are never picked" "/dev/sda (200G Test-SSD USB-DISK): removable or USB"
+untouched "USB disk"
+
+new_server alma
+sed -i 's/<missing disk> MISSING/\/dev\/nvme1n1p1/' "$R/show"; sed -i '/single/d' "$R/df"
+if rebuild yes; then said "whole pool: nothing to do" "nothing to do"; else bad "whole pool: nothing to do"; cat "$R/out"; fi
+
+new_server alma
+sed -i 's/<missing disk> MISSING/\/dev\/nvme1n1p1/' "$R/show"
+rebuild yes || true
+said "interrupted after replace: balances" "some chunks are not RAID1"
+if grep -qF "btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft /" "$R/log"; then ok "runs the balance"
+else bad "runs the balance"; cat "$R/log"; fi
+
+# The notice: written while degraded, removed once whole (paths redirected).
+sed -e "s|/run/motd.d|$WORK/run/motd.d|; s|/run/issue.d|$WORK/run/issue.d|" "$WORK/degraded-notice" > "$WORK/notice-test"
+new_server alma
+if PATH="$R/bin:$PATH" bash "$WORK/notice-test" > /dev/null && grep -q "sudo minipool-rebuild" "$WORK/run/motd.d/90-minipool" \
+    && grep -q "missing an SSD" "$WORK/run/issue.d/90-minipool.issue"; then ok "notice while degraded"
+else bad "notice while degraded"; fi
+sed -i 's/<missing disk> MISSING/\/dev\/nvme1n1p1/' "$R/show"; sed -i '/single/d' "$R/df"
+if PATH="$R/bin:$PATH" bash "$WORK/notice-test" > /dev/null && [[ ! -e $WORK/run/motd.d/90-minipool ]]; then ok "notice removed once whole"
+else bad "notice removed once whole"; fi
+
 # --- shellcheck ----------------------------------------------------------------
 echo "shellcheck"
 for ks in alma silverblue; do
@@ -335,7 +493,9 @@ for ks in alma silverblue; do
 done
 awk '/<<.SCRIPT.$/ {on = 1; next} /^SCRIPT$/ {on = 0} on' "$WORK/silverblue.ks" > "$WORK/rebase.sh"
 if shellcheck -s bash "$WORK/rebase.sh"; then ok "rebase.sh"; else bad "rebase.sh"; fi
-if shellcheck -s bash "$WORK/degraded-boot-entry"; then ok "degraded-boot-entry"; else bad "degraded-boot-entry"; fi
+for f in degraded-boot-entry minipool-rebuild degraded-notice; do
+    if shellcheck -s bash "$WORK/$f"; then ok "$f"; else bad "$f"; fi
+done
 if (cd "$HERE" && shellcheck -x build-usb.sh test-vm.sh tests/*.sh); then
     ok "build-usb.sh test-vm.sh tests/*.sh"
 else

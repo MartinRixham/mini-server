@@ -18,8 +18,9 @@
 #                       image info, no Silverblue /etc kept by the merge
 #   degraded-alma       drive 2 dies: on throwaway overlays of the disks, pick
 #                       Alma's degraded entry, swap drive 2 for a blank disk,
-#                       boot with one SSD missing, rebuild the pool onto the
-#                       blank disk as README.md says, boot normally, check raid1
+#                       boot with one SSD missing (checks the login notice),
+#                       rebuild the pool onto the blank disk with
+#                       minipool-rebuild, boot normally, check raid1
 #   degraded-bazzite    the same with drive 1 dying and Bazzite surviving
 #
 # Differences from a real install (only for unattended running):
@@ -283,6 +284,9 @@ cfg=/boot/grub2/custom.cfg
 check "booted normally, not degraded" bash -c '! grep -Eq "rootflags=[^ ]*degraded" /proc/cmdline'
 check "degraded udev rule installed" test -s /etc/udev/rules.d/65-minipool-degraded.rules
 check "minipool-degraded-boot.service is active" systemctl is-active minipool-degraded-boot.service
+check "minipool-degraded-notice.service is active" systemctl is-active minipool-degraded-notice.service
+check "no degraded notice on a whole pool" test ! -e /run/motd.d/90-minipool
+check "minipool-rebuild is on PATH" bash -c 'command -v minipool-rebuild'
 check "custom.cfg has the degraded entry" grep -q -- "--id minipool-degraded" "$cfg"
 check "degraded entry adds degraded to rootflags" grep -Eq "^  linux .* rootflags=([^ ]*,)?degraded( |$)" "$cfg"
 kernel=$(awk '$1 == "linux" {print $2; exit}' "$cfg" 2>/dev/null || true)
@@ -543,33 +547,10 @@ BOOT_DEGRADED_ONCE='unshare -m sh -c "test -w /boot/grub2 || mount -o remount,rw
     test -e /boot/grub2/grubenv || grub2-editenv - create
     grub2-editenv - set minipool_boot_once=degraded"'
 
-# Runs in the guest with POOL, BLANK (serial) and DEAD (1|2) prepended. The
-# same steps as "If an SSD dies" in README.md.
-REBUILD=$(cat <<'EOF'
-set -euo pipefail
-NEW=/dev/$(lsblk -dno NAME,SERIAL | awk -v s="$BLANK" '$2 == s {print $1}')
-[[ $NEW != /dev/ ]] || { echo "blank disk $BLANK not found"; exit 1; }
-show=$(btrfs filesystem show "$POOL"); echo "$show"
-MEMBER=$(awk '$1 == "devid" && $NF ~ "^/dev/" {print $NF}' <<<"$show")
-DEVID=$(awk '$1 == "devid" && tolower($0) ~ /missing/ {print $2}' <<<"$show")
-[[ -n $MEMBER && -n $DEVID ]] || { echo "could not tell the surviving member from the missing one"; exit 1; }
-MIB=$(( ($(blockdev --getsize64 "$MEMBER") + 1048575) / 1048576 ))
-echo "replacing devid $DEVID with a ${MIB} MiB partition on $NEW"
-if [[ $DEAD == 2 ]]; then
-    echo "size=${MIB}MiB, type=linux" | sfdisk --label gpt "$NEW"
-    PART=${NEW}p1
-else
-    printf 'size=600MiB, type=uefi\nsize=2048MiB, type=linux\nsize=%sMiB, type=linux\n' "$MIB" | sfdisk --label gpt "$NEW"
-    PART=${NEW}p3
-fi
-udevadm settle
-btrfs replace start -B "$DEVID" "$PART" "$POOL"
-btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft "$POOL"
-btrfs scrub start -B "$POOL"
-btrfs filesystem show "$POOL"
-btrfs filesystem df "$POOL"
-EOF
-)
+# The rebuild itself is minipool-rebuild, installed by both kickstarts: it has
+# to pick the blank disk on its own, and is told yes when it asks.
+REBUILD='echo yes | minipool-rebuild'
+NOTICE=/run/motd.d/90-minipool
 
 check_pool() {  # pool-path degraded|healthy
     local show df other
@@ -621,17 +602,23 @@ step_degraded() {  # alma|bazzite: the distro whose drive survives
         else bad "/sysroot is not mounted"; fi
     fi
     check_pool "$pool" degraded
+    if vm_ssh grep -q minipool-rebuild "$NOTICE"; then ok "login notice says to run minipool-rebuild"
+    else bad "no degraded notice in $NOTICE"; fi
+    if vm_ssh command -v minipool-rebuild >/dev/null; then ok "minipool-rebuild is on root's PATH"
+    else bad "minipool-rebuild is not on root's PATH"; fi
     check_settled
     [[ $CHECK_FAILED == 0 ]] || die "degraded boot of $who failed the checks"
 
     info "rebuilding the pool onto the blank disk"
-    if ! { echo "POOL=$pool BLANK=$blank DEAD=$dead"; echo "$REBUILD"; } \
-        | vm_ssh bash -s > "$LOGS/degraded-$who-rebuild.log" 2>&1; then
+    if ! vm_ssh "$REBUILD" > "$LOGS/degraded-$who-rebuild.log" 2>&1; then
         indent < "$LOGS/degraded-$who-rebuild.log"
         die "rebuild failed (see $LOGS/degraded-$who-rebuild.log)"
     fi
     indent < "$LOGS/degraded-$who-rebuild.log"
+    if grep -q "^The new SSD: .*$blank" "$LOGS/degraded-$who-rebuild.log"; then ok "picked the blank disk ($blank)"
+    else bad "did not pick the blank disk ($blank)"; fi
     check_pool "$pool" healthy
+    if vm_ssh test ! -e "$NOTICE"; then ok "notice removed after the rebuild"; else bad "notice still there after the rebuild"; fi
     stop
 
     boot "$keep" "degraded-$who-3-rebuilt"
@@ -640,6 +627,7 @@ step_degraded() {  # alma|bazzite: the distro whose drive survives
     if [[ $cmdline =~ degraded ]]; then bad "the degraded entry booted again: $cmdline"
     else ok "the normal entry booted"; fi
     check_pool "$pool" healthy
+    if vm_ssh test ! -e "$NOTICE"; then ok "no degraded notice"; else bad "degraded notice on a whole pool"; fi
     check_settled
     [[ $CHECK_FAILED == 0 ]] || die "$who after the rebuild failed the checks"
     stop

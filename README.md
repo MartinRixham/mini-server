@@ -94,39 +94,29 @@ Don't put the dead SSD back in later. Its copy of the pool is out of date.
 
 ### 2. Rebuild the pool onto the new SSD
 
-Run these as root on the surviving distro. `POOL` is `/` on Alma and `/var` on
-Bazzite, because Bazzite's `/` is not the pool itself.
+While the pool is missing an SSD, a notice at login and on the console says
+so. With the new SSD in, run this on the surviving distro:
 
 ```bash
-POOL=/                                # /var on Bazzite
-lsblk -o NAME,SIZE,SERIAL,FSTYPE      # the new SSD is the one with no partitions
-NEW=/dev/nvme1n1                      # the new SSD. Check twice: this erases it
-btrfs filesystem show $POOL           # one devid says "missing"
-DEVID=$(btrfs filesystem show $POOL | awk '$1=="devid" && tolower($0) ~ /missing/ {print $2}')
-MEMBER=$(btrfs filesystem show $POOL | awk '$1=="devid" && $NF ~ "^/dev/" {print $NF}')
-MIB=$(( ($(blockdev --getsize64 $MEMBER) + 1048575) / 1048576 ))
+sudo minipool-rebuild
 ```
 
-Partition the new SSD like the one it replaces:
+It works out which drive died from the distro you're on. It only picks the
+new SSD if that's the one blank internal disk big enough for the job. It shows
+the disk's size, model and serial and asks you to type `yes` before it erases
+it. Then it partitions the disk like the drive it replaces and copies the
+pool onto it (`btrfs replace`). Next it makes everything written while
+degraded RAID1 again (`btrfs balance`) and checks every copy (`btrfs scrub`).
+The copy takes a while. If you lose the session, the copy carries on in the
+kernel: run `minipool-rebuild` again to follow it and finish the rest.
 
-```bash
-# Drive 2 died (you're on Alma): the pool member, with the rest left free for Bazzite
-echo "size=${MIB}MiB, type=linux" | sfdisk --label gpt $NEW
-PART=${NEW}p1
+It stops without changing anything when it can't tell which disk is the new
+one:
 
-# Drive 1 died (you're on Bazzite): ESP, /boot, pool member
-printf 'size=600MiB, type=uefi\nsize=2048MiB, type=linux\nsize=%sMiB, type=linux\n' $MIB | sfdisk --label gpt $NEW
-PART=${NEW}p3
-```
-
-Then copy the pool onto it:
-
-```bash
-btrfs replace start -B $DEVID $PART $POOL     # copies everything onto the new SSD
-btrfs balance start -dconvert=raid1,soft -mconvert=raid1,soft $POOL   # makes what was written while degraded raid1 again
-btrfs scrub start -B $POOL                    # checks every copy
-btrfs filesystem df $POOL                     # Data, Metadata and System should all say RAID1
-```
+- **No blank disk.** New SSDs sometimes come formatted. Check with
+  `lsblk -f`, and if you're sure, clear it with `sudo wipefs -a /dev/nvme1n1`.
+- **More than one blank disk.** Pick one: `sudo minipool-rebuild --disk /dev/nvme1n1`.
+- **The disk holds part of the pool.** That's the old SSD. Don't reuse it.
 
 Reboot. The surviving distro now boots normally from its usual entry.
 
@@ -152,7 +142,8 @@ new SSD's serial and rebuild the stick. Then follow "3. Install Bazzite" above.
 
 **AlmaLinux (drive 1 died): rebuild its boot partitions from Bazzite.** This
 chroots into `@alma` and reinstalls the bootloader and kernels. It needs the
-network. Run it as root on Bazzite, with `NEW` set as in step 2:
+network. Run it as root on Bazzite, with `NEW` set to the new SSD (e.g.
+`NEW=/dev/nvme0n1`, the disk `minipool-rebuild` partitioned):
 
 ```bash
 mkfs.vfat -F 32 ${NEW}p1
