@@ -160,7 +160,9 @@ cat > /etc/systemd/system/rebase-to-bazzite.service <<'UNIT'
 [Unit]
 Description=Rebase this Silverblue install to Bazzite
 Wants=network-online.target
-After=network-online.target
+# After tuned: tuned started alongside an rpm-ostree transaction times out and
+# is left failed for that boot, which on the last boot is how the machine ends up.
+After=network-online.target tuned.service
 StartLimitIntervalSec=0
 
 [Service]
