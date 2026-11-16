@@ -160,9 +160,12 @@ cat > /etc/systemd/system/rebase-to-bazzite.service <<'UNIT'
 [Unit]
 Description=Rebase this Silverblue install to Bazzite
 Wants=network-online.target
-# After tuned: tuned started alongside an rpm-ostree transaction times out and
-# is left failed for that boot, which on the last boot is how the machine ends up.
-After=network-online.target tuned.service
+# After tuned and bazzite-hardware-setup: both call rpm-ostree, and one started
+# alongside our rpm-ostree transaction fails (tuned times out, hardware-setup
+# gets "Transaction in progress") and is left failed for that boot, which on the
+# last boot is how the machine ends up. bazzite-hardware-setup does not exist on
+# Silverblue; After= on a missing unit is a no-op.
+After=network-online.target tuned.service bazzite-hardware-setup.service
 StartLimitIntervalSec=0
 
 [Service]
