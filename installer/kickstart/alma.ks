@@ -104,10 +104,11 @@ set -euo pipefail
 
 @DEGRADED_BOOT@
 
-# The degraded entry needs the udev rule in the initramfs too, where the root
-# filesystem is mounted. dracut keeps it in every initramfs it builds from now on.
+# The udev rule and minipool-ready.service are needed in the initramfs too,
+# where the root filesystem is mounted. dracut keeps them in every initramfs it
+# builds from now on.
 cat > /etc/dracut.conf.d/minipool-degraded.conf <<'EOF'
-install_items+=" /etc/udev/rules.d/65-minipool-degraded.rules "
+install_items+=" /etc/udev/rules.d/65-minipool-degraded.rules /etc/systemd/system/minipool-ready.service "
 EOF
 dracut -f --regenerate-all
 %end

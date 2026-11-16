@@ -225,11 +225,17 @@ for ks in alma silverblue; do
     else ok "$ks.ks %post sets up the degraded boot entry"; fi
 done
 expect() { local d=$1; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
-expect "alma.ks puts the udev rule in the initramfs" \
-    grep -qF 'install_items+=" /etc/udev/rules.d/65-minipool-degraded.rules "' "$WORK/alma.ks"
+expect "alma.ks puts the udev rule and minipool-ready.service in the initramfs" \
+    grep -qF 'install_items+=" /etc/udev/rules.d/65-minipool-degraded.rules /etc/systemd/system/minipool-ready.service "' "$WORK/alma.ks"
 # shellcheck disable=SC2016  # literal text in the kickstart
-expect "rebase.sh puts the udev rule in the initramfs" \
-    grep -qF 'rpm-ostree initramfs-etc --track="$DEGRADED_RULE"' "$WORK/silverblue.ks"
+expect "rebase.sh puts the udev rule and minipool-ready.service in the initramfs" \
+    grep -qF 'rpm-ostree initramfs-etc --track="$DEGRADED_RULE" --track="$READY_UNIT"' "$WORK/silverblue.ks"
+for ks in alma silverblue; do
+    expect "$ks.ks: the udev rule pulls in minipool-ready.service" \
+        grep -qxF 'ENV{SYSTEMD_WANTS}+="minipool-ready.service"' "$WORK/$ks.ks"
+    expect "$ks.ks: minipool-ready.service is written" \
+        grep -qxF "cat > /etc/systemd/system/minipool-ready.service <<'UNIT'" "$WORK/$ks.ks"
+done
 
 awk "/<<'ENTRYSCRIPT'\$/ {on = 1; next} /^ENTRYSCRIPT\$/ {on = 0} on" "$WORK/alma.ks" > "$WORK/degraded-boot-entry"
 chmod +x "$WORK/degraded-boot-entry"

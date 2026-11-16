@@ -27,6 +27,11 @@ kickstarts' `%post`:
   file. Bazzite's initramfs comes prebuilt in the image, so the first-boot
   service adds the rule with `rpm-ostree initramfs-etc` and reboots one more
   time. That overlay is the one way Bazzite differs from a fresh ISO install.
+- The same rule starts `minipool-ready.service`, which is in the initramfs too.
+  It makes normal boots reliable. When the last pool member appears,
+  `64-btrfs.rules` re-checks the members still marked "not ready" only once,
+  and can miss one whose udev event hasn't finished. The boot then waits
+  forever. The service repeats that re-check until no member is waiting.
 
 The same fragment installs `minipool-rebuild` (`/etc/minipool/rebuild`, linked
 into `/usr/local/bin` by a `tmpfiles.d` entry, because on ostree `/usr/local`

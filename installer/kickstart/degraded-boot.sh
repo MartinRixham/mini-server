@@ -7,6 +7,8 @@
 #   ever starts. This rule marks it ready anyway, but only when the kernel
 #   command line has "degraded" in rootflags=. Each kickstart also puts the rule
 #   in the initramfs (Alma: dracut.conf.d; Bazzite: rpm-ostree initramfs-etc).
+# - minipool-ready.service, pulled in by the same rule and also in the
+#   initramfs: makes a normal boot of the whole pool reliable (see the unit).
 # - a boot menu entry "... - one SSD missing (degraded)": a copy of the default
 #   entry with ",degraded" added to rootflags=, kept in /boot/grub2/custom.cfg
 #   (sourced by Alma's grub.cfg and by Fedora's static one) and rewritten at
@@ -21,10 +23,31 @@ SUBSYSTEM!="block", GOTO="minipool_degraded_end"
 ACTION=="remove", GOTO="minipool_degraded_end"
 ENV{ID_FS_TYPE}!="btrfs", GOTO="minipool_degraded_end"
 ENV{ID_FS_LABEL}!="minipool", GOTO="minipool_degraded_end"
+# Once a member is ready, re-check any still marked waiting (see the unit).
+ENV{SYSTEMD_WANTS}+="minipool-ready.service"
 IMPORT{cmdline}="rootflags"
 ENV{rootflags}=="*degraded*", ENV{SYSTEMD_READY}="1"
 LABEL="minipool_degraded_end"
 RULES
+
+# 64-btrfs.rules marks each member "not ready" until the whole pool has been
+# seen. When the last member arrives it re-checks the waiting ones once, with
+# "udevadm trigger -p ID_BTRFS_READY=0". That reads udev's database, so a member
+# whose own event is still being processed is missed: it stays not ready and
+# the boot waits for the root device forever (seen in CI, both members found).
+# This repeats that re-check after udev settles, until nothing waits (60 s at
+# most). Started by the rule above via SYSTEMD_WANTS, which systemd only acts on
+# for a ready member, so it needs no enable symlink. A no-op on a degraded boot,
+# where the rule above marks the members ready itself.
+cat > /etc/systemd/system/minipool-ready.service <<'UNIT'
+[Unit]
+Description=Re-check minipool members still waiting for the rest of the pool
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'read -r cmdline </proc/cmdline; for a in $$cmdline; do case $$a in rootflags=*degraded*) exit 0;; esac; done; udevadm settle --timeout=30; i=0; while [ $$i -lt 60 ]; do [ -n "$$(udevadm trigger --dry-run --verbose --subsystem-match=block --property-match=ID_BTRFS_READY=0)" ] || exit 0; udevadm trigger --action=change --settle --subsystem-match=block --property-match=ID_BTRFS_READY=0; sleep 1; i=$$((i + 1)); done'
+UNIT
 
 cat > /etc/minipool/degraded-boot-entry <<'ENTRYSCRIPT'
 #!/bin/bash

@@ -285,6 +285,7 @@ fi
 cfg=/boot/grub2/custom.cfg
 check "booted normally, not degraded" bash -c '! grep -Eq "rootflags=[^ ]*degraded" /proc/cmdline'
 check "degraded udev rule installed" test -s /etc/udev/rules.d/65-minipool-degraded.rules
+check "minipool-ready.service installed" test -s /etc/systemd/system/minipool-ready.service
 check "minipool-degraded-boot.service is active" systemctl is-active minipool-degraded-boot.service
 check "minipool-degraded-notice.service is active" systemctl is-active minipool-degraded-notice.service
 check "no degraded notice on a whole pool" test ! -e /run/motd.d/90-minipool
@@ -296,6 +297,8 @@ check "degraded entry's kernel exists (/boot$kernel)" test -f "/boot$kernel"
 if [[ $MODE == alma ]]; then
     check "initramfs has the degraded udev rule" \
         bash -c "lsinitrd /boot/initramfs-\$(uname -r).img | grep -q 65-minipool-degraded.rules"
+    check "initramfs has minipool-ready.service" \
+        bash -c "lsinitrd /boot/initramfs-\$(uname -r).img | grep -q minipool-ready.service"
 fi
 
 show=$(btrfs filesystem show "$POOL")
@@ -404,6 +407,7 @@ check_no_leftovers() {
 }
 
 DEGRADED_RULE=/etc/udev/rules.d/65-minipool-degraded.rules
+READY_UNIT=/etc/systemd/system/minipool-ready.service
 
 check_deployments() {  # wanted-image-ref
     local status others local_state
@@ -416,17 +420,21 @@ check_deployments() {  # wanted-image-ref
     local_state=$(jq -r '.deployments[] | select(.booted) | to_entries[]
         | select(.key | test("^(requested-)?(packages|local-packages|base-removals|base-local-replacements|local-fileoverride-packages|modules)$|^initramfs-(args|etc)$"))
         | select((.value // []) | length > 0)
-        | select(.key != "initramfs-etc" or .value != [$rule]) | "\(.key): \(.value | tostring)"' \
-        --arg rule "$DEGRADED_RULE" <<<"$status")
+        | select(.key != "initramfs-etc" or (.value | sort) != ([$rule, $unit] | sort))
+        | "\(.key): \(.value | tostring)"' \
+        --arg rule "$DEGRADED_RULE" --arg unit "$READY_UNIT" <<<"$status")
     local_state+=$'\n'$(jq -r '.deployments[] | select(.booted)
         | (if .["regenerate-initramfs"] == true then "regenerate-initramfs: true\n" else "" end)
         + (if (.unlocked // "none") != "none" then "unlocked: \(.unlocked)\n" else "" end)' <<<"$status")
     if [[ -z ${local_state//[[:space:]]/} ]]; then ok "no layered packages, overrides, initramfs changes or unlock"
     else bad "booted deployment has local changes:"; indent <<<"$local_state"; fi
-    # The one deliberate difference: the degraded boot entry's udev rule.
-    if jq -e --arg r "$DEGRADED_RULE" '.deployments[] | select(.booted) | (.["initramfs-etc"] // []) | index($r)' \
-        <<<"$status" >/dev/null; then ok "initramfs-etc adds $DEGRADED_RULE"
-    else bad "initramfs-etc does not track $DEGRADED_RULE"; fi
+    # The one deliberate difference: the minipool udev rule and unit.
+    local f
+    for f in "$DEGRADED_RULE" "$READY_UNIT"; do
+        if jq -e --arg r "$f" '.deployments[] | select(.booted) | (.["initramfs-etc"] // []) | index($r)' \
+            <<<"$status" >/dev/null; then ok "initramfs-etc adds $f"
+        else bad "initramfs-etc does not track $f"; fi
+    done
 }
 
 check_image_info() {  # needs BAZZITE_IMAGE, FEDORA_VERSION
