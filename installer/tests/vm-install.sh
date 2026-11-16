@@ -365,7 +365,30 @@ check_settled() {
     state=$(vm_ssh 'timeout 600 systemctl is-system-running --wait' 2>/dev/null || true)
     failed=$(vm_ssh systemctl --failed --plain --no-legend 2>/dev/null || true)
     if [[ $state == running ]]; then ok "system is running, no failed units"
-    else bad "system state '${state:-unknown}'; failed units:"; indent <<<"$failed"; fi
+    else
+        bad "system state '${state:-unknown}'; failed units:"; indent <<<"$failed"
+        log_failed_units "$failed"
+    fi
+}
+
+# Why the units failed: each one's status and journal for this boot, the tail
+# of it in the job log, and the whole boot's journal beside them (what the unit
+# was waiting on, SELinux denials) since the serial log has none of it.
+log_failed_units() {  # "systemctl --failed --plain --no-legend" output
+    local unit log
+    while read -r unit _ <&3; do  # fd 3: ssh would eat the list on stdin
+        [[ -n $unit ]] || continue
+        log="$LOGS/failed-$unit.log"
+        {
+            vm_ssh "systemctl status --no-pager --full --lines=0 $(printf %q "$unit")" || true
+            echo
+            vm_ssh "journalctl -b --no-pager -o short-monotonic -u $(printf %q "$unit")" || true
+        } > "$log" 2>&1
+        info "$unit: last lines of $log"
+        tail -n 40 "$log" | indent
+    done 3<<<"$1"
+    vm_ssh journalctl -b --no-pager -o short-monotonic > "$LOGS/failed-boot-journal.log" 2>&1 || true
+    info "journal of this boot: $LOGS/failed-boot-journal.log"
 }
 
 check_no_leftovers() {
