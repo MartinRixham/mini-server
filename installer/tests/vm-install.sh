@@ -51,6 +51,7 @@ REBASE_TIMEOUT_MIN=${REBASE_TIMEOUT_MIN:-150}
 SSH_PORT=${SSH_PORT:-2222}
 ALMA_SERIAL=VMALMA0001
 BAZZITE_SERIAL=VMBAZZ0002
+TEST_USER=tester
 
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -590,15 +591,37 @@ step_install_bazzite() {
     vm_ssh 'cat > /root/mini-server/install-bazzite.sh && chmod +x /root/mini-server/install-bazzite.sh' \
         < "$HERE/install-bazzite.sh"
     vm_ssh 'cat > /root/mini-server/kickstart/degraded-boot.sh' < "$HERE/kickstart/degraded-boot.sh"
+    # A user on Alma for the script to copy (the real install has the one
+    # Anaconda made). Its shadow line is what Bazzite's must match.
+    vm_ssh "id $TEST_USER >/dev/null 2>&1 || useradd -m -c 'CI tester' $TEST_USER
+            echo $TEST_USER:\$(head -c 12 /dev/urandom | base64) | chpasswd"
+    vm_ssh "getent passwd $TEST_USER | cut -d: -f3; getent shadow $TEST_USER | cut -d: -f2" > "$WORK/test-user"
     info "running install-bazzite.sh (log $LOGS/install-bazzite.log)"
     local rc=0
     vm_ssh "/root/mini-server/install-bazzite.sh --yes --image $(printf %q "$BAZZITE_IMAGE") \
-            --root-ssh-keys /root/.ssh/authorized_keys" 2>&1 | tee "$LOGS/install-bazzite.log" || rc=$?
+            --user $TEST_USER --root-ssh-keys /root/.ssh/authorized_keys" 2>&1 | tee "$LOGS/install-bazzite.log" || rc=$?
     [[ $rc == 0 ]] || die "install-bazzite.sh failed (exit $rc)"
     vm_ssh efibootmgr -v | tee "$LOGS/install-bazzite-efibootmgr.txt"
     stop
     touch "$WORK/bazzite.done"
     info "bazzite installed with bootc"
+}
+
+# The user install-bazzite.sh copied from Alma: same uid and password, in
+# wheel, with a home Bazzite labels and owns properly.
+check_test_user() {
+    local uid hash got
+    { read -r uid; read -r hash; } < "$WORK/test-user"
+    got=$(vm_ssh "getent passwd $TEST_USER | cut -d: -f3" || true)
+    if [[ $got == "$uid" ]]; then ok "$TEST_USER exists with Alma's uid $uid"; else bad "$TEST_USER uid is '$got', want $uid"; fi
+    got=$(vm_ssh "getent shadow $TEST_USER | cut -d: -f2" || true)
+    if [[ -n $hash && $got == "$hash" ]]; then ok "$TEST_USER has Alma's password"; else bad "$TEST_USER password differs from Alma's"; fi
+    if vm_ssh "id -nG $TEST_USER | tr ' ' '\n' | grep -qx wheel"; then ok "$TEST_USER is in wheel"; else bad "$TEST_USER is not in wheel"; fi
+    # shellcheck disable=SC2016  # expands in the guest
+    got=$(vm_ssh 'h=$(getent passwd '"$TEST_USER"' | cut -d: -f6); stat -L -c "%U %C" "$h" && test -s "$h/.bashrc" && echo skel' || true)
+    echo "  home: ${got//$'\n'/ }"
+    if [[ $got == "$TEST_USER "*:user_home_dir_t:*skel ]]; then ok "home is $TEST_USER's, labelled user_home_dir_t, from /etc/skel"
+    else bad "home is not set up right"; fi
 }
 
 step_check_bazzite_bootc() {
@@ -635,6 +658,7 @@ step_check_bazzite_bootc() {
     check_settled
     check_deployments "$want"
     check_image_info
+    check_test_user
     if vm_ssh 'grep -rqs custom.cfg /boot/grub2/grub.cfg'; then ok "Bazzite's grub.cfg sources custom.cfg"
     else bad "Bazzite's grub.cfg does not source custom.cfg"; vm_ssh cat /boot/grub2/grub.cfg || true; fi
     vm_ssh ostree admin config-diff > "$LOGS/bazzite-config-diff.txt" || true

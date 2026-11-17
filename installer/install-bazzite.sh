@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install Bazzite onto drive 2 from a running AlmaLinux, with bootc.
 #
-#   sudo ./install-bazzite.sh [--image REF] [--root-ssh-keys FILE] [--yes]
+#   sudo ./install-bazzite.sh [--image REF] [--user NAME | --no-user]
+#                             [--root-ssh-keys FILE] [--yes]
 #
 # Adds Bazzite's ESP and /boot in the free space alma.ks left at the end of
 # drive 2, creates the @bazzite subvolume in the minipool pool, and runs
@@ -15,12 +16,14 @@
 # ones), and sets up a one-shot first-boot unit that adds the minipool udev
 # rule and unit to Bazzite's prebuilt initramfs and reboots once.
 #
-# SPIKE: no user account is created yet. --root-ssh-keys is for the VM test.
+# The user who ran sudo (or --user NAME) is copied from Alma: same name, uid
+# and password, in wheel, with a fresh home in Bazzite's /var/home.
+# --root-ssh-keys is for the VM test.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMAGE=ghcr.io/ublue-os/bazzite:stable
-SSH_KEYS="" YES=""
+SSH_KEYS="" YES="" USER_NAME=${SUDO_USER:-}
 POOL_LABEL=minipool
 ESP_MIB=600
 BOOT_MIB=2048
@@ -36,8 +39,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --image)         IMAGE=${2:?}; shift 2 ;;
         --root-ssh-keys) SSH_KEYS=$(realpath "${2:?}"); shift 2 ;;
+        --user)          USER_NAME=${2:?}; shift 2 ;;
+        --no-user)       USER_NAME=""; shift ;;
         --yes)           YES=1; shift ;;
-        -h|--help)       sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)       sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)               die "unknown option: $1" ;;
     esac
 done
@@ -49,6 +54,13 @@ done
 [[ $(findmnt -no FSTYPE,FSROOT /) == "btrfs /@alma" ]] || die "/ is not @alma on btrfs"
 [[ -f $FRAGMENT ]] || die "degraded-boot.sh not found (set DEGRADED_BOOT=)"
 [[ -z $SSH_KEYS || -s $SSH_KEYS ]] || die "$SSH_KEYS is empty"
+USER_UID="" USER_HASH="" USER_GECOS=""
+if [[ -n $USER_NAME ]]; then
+    IFS=: read -r _ _ USER_UID _ USER_GECOS _ < <(getent passwd "$USER_NAME") \
+        || die "no user '$USER_NAME' on Alma (use --user NAME or --no-user)"
+    (( USER_UID >= 1000 )) || die "'$USER_NAME' is a system account (uid $USER_UID)"
+    USER_HASH=$(getent shadow "$USER_NAME" | cut -d: -f2)
+fi
 
 # --- which disk ------------------------------------------------------------------
 # Drive 1 holds Alma's /boot/efi; drive 2 is the disk with the other pool member.
@@ -80,6 +92,7 @@ free_mib=$(( $(sfdisk --list-free --bytes "$D2" | awk '$1 ~ /^[0-9]+$/ && $3 ~ /
 echo "Drive 1 (AlmaLinux): $D1 $(lsblk -dno MODEL,SERIAL "$D1")"
 echo "Drive 2 (Bazzite):   $D2 $(lsblk -dno MODEL,SERIAL "$D2"), ${free_mib} MiB free"
 echo "Image: $IMAGE"
+echo "User:  ${USER_NAME:-none (root only)}"
 echo "This adds an ESP and /boot on $D2 and a @bazzite subvolume. Nothing existing is erased."
 if [[ -z $YES ]]; then
     read -rp "Type yes to continue: " a
@@ -121,23 +134,45 @@ if [[ -n $SSH_KEYS ]]; then
     keys_mount=(-v "$SSH_KEYS:/run/root-keys:ro,z")
     keys_arg=(--root-ssh-authorized-keys /run/root-keys)
 fi
+in_image() {  # command... : run in the Bazzite image, with the target at /target
+    podman run --rm --privileged --pid=host \
+        --security-opt label=type:unconfined_t \
+        -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
+        -v "$T:/target" \
+        "${keys_mount[@]}" \
+        "$IMAGE" "$@"
+}
+ORDER=$(efibootmgr | sed -n 's/^BootOrder: //p')
+
 step "bootc install to-filesystem"
 # --skip-finalize: finalizing freezes the filesystem, and this one is Alma's
 # root too.
-podman run --rm --privileged --pid=host \
-    --security-opt label=type:unconfined_t \
-    -v /dev:/dev -v /var/lib/containers:/var/lib/containers \
-    -v "$T:/target" \
-    "${keys_mount[@]}" \
-    "$IMAGE" \
-    bootc install to-filesystem \
+# --bootloader none: bootc hands bootupd the disk of the root filesystem, and
+# with a pool spanning both drives that is drive 1, so bootupd would install
+# onto Alma's ESP. bootupd runs below, pointed at drive 2.
+in_image bootc install to-filesystem \
         --target-imgref "$IMAGE" --enforce-container-sigpolicy \
         --root-mount-spec "UUID=$POOL_UUID" \
         --boot-mount-spec "UUID=$BOOT_UUID" \
         --karg "rootflags=subvol=@bazzite" \
-        --skip-finalize \
+        --skip-finalize --bootloader none \
         "${keys_arg[@]}" \
         /target
+
+step "installing the bootloader on $D2 (bootupd)"
+in_image bootupctl backend install --write-uuid --update-firmware --auto \
+    --with-static-configs --device "$D2" /target
+[[ -d $T/boot/efi/EFI/fedora ]] || die "bootupd did not install to Bazzite's ESP ($ESP)"
+[[ ! -e /boot/efi/EFI/fedora ]] || die "Bazzite's bootloader ended up on Alma's ESP (/boot/efi/EFI/fedora)"
+
+# bootupd puts its new entry first. Keep Alma the default: the old order,
+# then whatever is new.
+if [[ -n $ORDER ]]; then
+    now=$(efibootmgr | sed -n 's/^BootOrder: //p')
+    added=$(tr ',' '\n' <<<"$now" | grep -vxF -f <(tr ',' '\n' <<<"$ORDER") | paste -sd, || true)
+    efibootmgr -q -o "$ORDER${added:+,$added}"
+    step "firmware boot order: $ORDER${added:+,$added} (Bazzite: ${added:-none added})"
+fi
 
 # --- into the new deployment's /etc ---------------------------------------------
 mapfile -t DEPLOYS < <(compgen -G "$T/ostree/deploy/*/deploy/*.0" || true)
@@ -145,7 +180,17 @@ mapfile -t DEPLOYS < <(compgen -G "$T/ostree/deploy/*/deploy/*.0" || true)
 DEP=${DEPLOYS[0]}
 step "configuring $DEP"
 
+# The deployment's /var is empty until boot mounts the stateroot's over it.
+VAR=$(dirname "$(dirname "$DEP")")/var
+mkdir -p "$DEP/proc" "$VAR/home"
+mount -t proc proc "$DEP/proc"
+mount --bind "$VAR" "$DEP/var"
 chroot "$DEP" /bin/bash -s < "$FRAGMENT"
+
+if [[ -n $USER_NAME ]]; then
+    step "adding user $USER_NAME (uid $USER_UID, wheel, password from Alma)"
+    chroot "$DEP" useradd -m -u "$USER_UID" -G wheel -c "$USER_GECOS" -p "$USER_HASH" "$USER_NAME"
+fi
 
 if compgen -G "/etc/NetworkManager/system-connections/*" >/dev/null; then
     cp -a /etc/NetworkManager/system-connections/. "$DEP/etc/NetworkManager/system-connections/"
@@ -192,22 +237,16 @@ RestartSec=60
 WantedBy=multi-user.target
 UNIT
 chroot "$DEP" systemctl enable minipool-initramfs-firstboot.service
+umount "$DEP/proc"
 
-# Label what was written here with the deployment's own policy.
-fc=$DEP/etc/selinux/targeted/contexts/files/file_contexts
-[[ -f $fc ]] && setfiles -r "$DEP" "$fc" "$DEP/etc" || echo "warning: could not relabel $DEP/etc"
-
-# --- firmware boot entry ----------------------------------------------------------
-loader=$(cd "$T/boot/efi" && find EFI -iname 'shimx64.efi' ! -ipath 'EFI/BOOT/*' | head -1)
-if [[ -n $loader ]]; then
-    order=$(efibootmgr | sed -n 's/^BootOrder: //p')
-    efibootmgr -q -c -d "$D2" -p 2 -L Bazzite -l "\\${loader//\//\\}"
-    new=$(efibootmgr | awk '/ Bazzite/ {sub(/^Boot/, "", $1); sub(/\*$/, "", $1); print $1}' | tail -1)
-    [[ -n $order && -n $new ]] && efibootmgr -q -o "$order,$new"
-    step "firmware boot entry Boot$new added after the existing ones"
-else
-    echo "warning: no shimx64.efi on Bazzite's ESP; no firmware boot entry added"
-fi
+# Label what was written here. Bazzite's own setfiles and policy: Alma's
+# setfiles can't read Bazzite's newer file_contexts and rejects its types.
+step "relabelling /etc and /var/home"
+rel=${DEP#"$T"}
+# shellcheck disable=SC2016  # expands in the container
+in_image sh -c 'set -e; d=/target$1; p=$(ls "$d"/etc/selinux/targeted/policy/policy.* | sort -V | tail -1)
+    setfiles -c "$p" -r "$d" "$d/etc/selinux/targeted/contexts/files/file_contexts" "$d/etc" "$d/var/home"' _ "$rel"
+umount "$DEP/var"
 
 cleanup
 trap - EXIT

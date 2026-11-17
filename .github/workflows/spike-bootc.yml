@@ -2,7 +2,7 @@ name: spike-bootc
 
 on:
   push:
-    branches: ["spike/**"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
