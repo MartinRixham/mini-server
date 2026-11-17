@@ -1,0 +1,89 @@
+name: spike-bootc
+
+on:
+  push:
+    branches: ["spike/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: installer
+
+jobs:
+  vm-bootc:
+    # Spike: like vm-install, but Bazzite is installed from Alma with
+    # install-bazzite.sh (bootc install to-filesystem) instead of Silverblue.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    concurrency:
+      group: vm-bootc-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          if ! test -w /dev/kvm; then
+            echo "::error::/dev/kvm is not usable on this runner"
+            ls -l /dev/kvm || true
+            grep -c -E 'vmx|svm' /proc/cpuinfo || echo "no vmx/svm CPU flags"
+            lsmod | grep kvm || echo "no kvm modules loaded"
+            exit 1
+          fi
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends qemu-system-x86 qemu-utils ovmf xorriso jq
+
+      # The two VM disks grow to ~40 GB (raid1 writes everything twice).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt || true
+          best=$RUNNER_TEMP
+          if mountpoint -q /mnt && [[ $(df --output=avail /mnt | tail -1) -gt $(df --output=avail "$RUNNER_TEMP" | tail -1) ]]; then
+            best=/mnt
+          fi
+          sudo mkdir -p "$best/vm-ci" && sudo chown "$USER" "$best/vm-ci"
+          echo "VM_WORK=$best/vm-ci" >> "$GITHUB_ENV"
+          df -h "$best"
+
+      - name: Prepare (ISOs, kickstarts, blank disks)
+        run: tests/vm-install.sh --work "$VM_WORK" prepare
+
+      - name: Install AlmaLinux
+        run: tests/vm-install.sh --work "$VM_WORK" install-alma
+
+      - name: Check AlmaLinux
+        run: tests/vm-install.sh --work "$VM_WORK" check-alma
+
+      - name: Install Bazzite from Alma with bootc
+        run: tests/vm-install.sh --work "$VM_WORK" install-bazzite
+
+      - name: Check Bazzite
+        run: tests/vm-install.sh --work "$VM_WORK" check-bazzite-bootc
+
+      - name: Check AlmaLinux still boots
+        run: tests/vm-install.sh --work "$VM_WORK" check-alma
+
+      - name: Drive 2 dies, Alma boots degraded, rebuild
+        run: tests/vm-install.sh --work "$VM_WORK" degraded-alma
+
+      - name: Drive 1 dies, Bazzite boots degraded, rebuild
+        run: tests/vm-install.sh --work "$VM_WORK" degraded-bazzite
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vm-bootc-logs
+          path: ${{ env.VM_WORK }}/logs
+          if-no-files-found: ignore

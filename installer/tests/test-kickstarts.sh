@@ -546,13 +546,15 @@ for ks in alma silverblue; do
 done
 awk '/<<.SCRIPT.$/ {on = 1; next} /^SCRIPT$/ {on = 0} on' "$WORK/silverblue.ks" > "$WORK/rebase.sh"
 if shellcheck -s bash "$WORK/rebase.sh"; then ok "rebase.sh"; else bad "rebase.sh"; fi
+awk '/<<.SCRIPT.$/ {on = 1; next} /^SCRIPT$/ {on = 0} on' "$HERE/install-bazzite.sh" > "$WORK/initramfs-firstboot"
+if shellcheck -s bash "$WORK/initramfs-firstboot"; then ok "initramfs-firstboot"; else bad "initramfs-firstboot"; fi
 for f in degraded-boot-entry minipool-rebuild degraded-notice; do
     if shellcheck -s bash "$WORK/$f"; then ok "$f"; else bad "$f"; fi
 done
-if (cd "$HERE" && shellcheck -x build-usb.sh test-vm.sh tests/*.sh); then
-    ok "build-usb.sh test-vm.sh tests/*.sh"
+if (cd "$HERE" && shellcheck -x build-usb.sh install-bazzite.sh test-vm.sh tests/*.sh); then
+    ok "build-usb.sh install-bazzite.sh test-vm.sh tests/*.sh"
 else
-    bad "build-usb.sh test-vm.sh tests/*.sh"
+    bad "build-usb.sh install-bazzite.sh test-vm.sh tests/*.sh"
 fi
 
 echo

@@ -25,6 +25,12 @@
 #                       minipool-rebuild also rebuilds Alma's boot, then Alma
 #                       is booted from the new drive and checked like check-alma
 #
+# Alternative to install-silverblue + check-bazzite (spike):
+#   install-bazzite     boot Alma, run install-bazzite.sh (bootc install
+#                       to-filesystem onto drive 2)
+#   check-bazzite-bootc boot drive 2, check layout, wait for the first-boot
+#                       initramfs reboot, check it like a fresh install
+#
 # Differences from a real install (only for unattended running):
 # - the ISOs' kernels are booted directly with inst.ks=, not through Ventoy
 # - the kickstarts get a CI add-on: text-only install, language, keyboard,
@@ -57,6 +63,7 @@ mkdir -p "$LOGS"
 # steps swap in overlays and a blank disk.
 DISKS=("$WORK/disk1.qcow2:$ALMA_SERIAL" "$WORK/disk2.qcow2:$BAZZITE_SERIAL")
 VARS=$WORK/vars.fd
+bazzite_done() { [[ -f $WORK/silverblue.done || -f $WORK/bazzite.done ]]; }
 
 # --- QEMU --------------------------------------------------------------------
 find_ovmf() {
@@ -323,7 +330,7 @@ EOF
 
 guest_check() {  # alma|bazzite
     local bazzite_installed=0
-    [[ -f $WORK/silverblue.done ]] && bazzite_installed=1
+    bazzite_done && bazzite_installed=1
     info "checks ($1)"
     { echo "MODE=$1 ALMA_SERIAL=$ALMA_SERIAL BAZZITE_SERIAL=$BAZZITE_SERIAL"
       echo "BAZZITE_ESPS=$bazzite_installed"
@@ -339,7 +346,7 @@ booted_image() {
 step_check_alma() {
     [[ -f $WORK/alma.done ]] || die "run install-alma first"
     local name=boot-alma
-    [[ -f $WORK/silverblue.done ]] && name="boot-alma-after-bazzite"
+    bazzite_done && name="boot-alma-after-bazzite"
     boot "$ALMA_SERIAL" "$name"
     guest_check alma
     stop
@@ -573,6 +580,70 @@ step_check_bazzite() {
     stop
 }
 
+# --- Bazzite with bootc from Alma (spike) ------------------------------------------
+step_install_bazzite() {
+    [[ -f $WORK/alma.done ]] || die "run install-alma first"
+    # shellcheck source=/dev/null
+    source "$WORK/config.env"
+    boot "$ALMA_SERIAL" install-bazzite
+    vm_ssh 'mkdir -p /root/mini-server/kickstart'
+    vm_ssh 'cat > /root/mini-server/install-bazzite.sh && chmod +x /root/mini-server/install-bazzite.sh' \
+        < "$HERE/install-bazzite.sh"
+    vm_ssh 'cat > /root/mini-server/kickstart/degraded-boot.sh' < "$HERE/kickstart/degraded-boot.sh"
+    info "running install-bazzite.sh (log $LOGS/install-bazzite.log)"
+    local rc=0
+    vm_ssh "/root/mini-server/install-bazzite.sh --yes --image $(printf %q "$BAZZITE_IMAGE") \
+            --root-ssh-keys /root/.ssh/authorized_keys" 2>&1 | tee "$LOGS/install-bazzite.log" || rc=$?
+    [[ $rc == 0 ]] || die "install-bazzite.sh failed (exit $rc)"
+    vm_ssh efibootmgr -v | tee "$LOGS/install-bazzite-efibootmgr.txt"
+    stop
+    touch "$WORK/bazzite.done"
+    info "bazzite installed with bootc"
+}
+
+step_check_bazzite_bootc() {
+    [[ -f $WORK/bazzite.done ]] || die "run install-bazzite first"
+    # shellcheck source=/dev/null
+    source "$WORK/config.env"
+    local want="ostree-image-signed:docker://$BAZZITE_IMAGE" ref
+    boot "$BAZZITE_SERIAL" boot-bazzite-bootc
+    vm_ssh rpm-ostree status -v | tee "$LOGS/bazzite-bootc-status.txt"
+    vm_ssh cat /proc/cmdline | tee "$LOGS/bazzite-cmdline.txt"
+    ref=$(booted_image || true)
+    if [[ $ref == "$want" ]]; then ok "booted $want"; else bad "booted image is '$ref', want $want"; fi
+    guest_check bazzite || CHECK_FAILED=1
+
+    # The first-boot unit adds the initramfs overlay, reboots, then removes itself.
+    # shellcheck disable=SC2016  # expands in the guest
+    local gone='test ! -e /etc/systemd/system/minipool-initramfs-firstboot.service &&
+        [ "$(systemctl show -P ActiveState minipool-initramfs-firstboot.service)" = inactive ] && echo gone'
+    local deadline=$((SECONDS + 20 * 60))
+    info "waiting for the first-boot initramfs reboot"
+    until [[ $(vm_ssh "$gone" 2>/dev/null) == gone ]]; do
+        if [[ $SECONDS -ge $deadline ]]; then
+            vm_ssh journalctl -b -u minipool-initramfs-firstboot --no-pager -n 50 || true
+            screenshot firstboot-timeout
+            die "first-boot unit did not finish within 20 minutes"
+        fi
+        vm_running || die "VM exited during the first-boot reboot"
+        sleep 20
+    done
+    vm_ssh rpm-ostree status
+
+    info "checks (after the first-boot reboot)"
+    guest_check bazzite || CHECK_FAILED=1
+    check_settled
+    check_deployments "$want"
+    check_image_info
+    if vm_ssh 'grep -rqs custom.cfg /boot/grub2/grub.cfg'; then ok "Bazzite's grub.cfg sources custom.cfg"
+    else bad "Bazzite's grub.cfg does not source custom.cfg"; vm_ssh cat /boot/grub2/grub.cfg || true; fi
+    vm_ssh ostree admin config-diff > "$LOGS/bazzite-config-diff.txt" || true
+    vm_ssh systemctl list-units --all --no-pager > "$LOGS/bazzite-units.txt" 2>&1 || true
+    [[ $CHECK_FAILED == 0 ]] || die "bootc-installed Bazzite failed the checks (see above and $LOGS)"
+    info "bootc-installed Bazzite matches a fresh install"
+    stop
+}
+
 # --- one SSD dies ----------------------------------------------------------------
 # Next boot only: the degraded entry. A person picks it in the GRUB menu;
 # the VM has no one at the console, so it sets the one-shot flag instead.
@@ -605,7 +676,7 @@ check_pool() {  # pool-path degraded|healthy
 }
 
 step_degraded() {  # alma|bazzite: the distro whose drive survives
-    [[ -f $WORK/silverblue.done ]] || die "run install-silverblue first"
+    bazzite_done || die "install Bazzite first"
     local who=$1 keep dead pool t=$WORK/degraded-$1 n
     if [[ $who == alma ]]; then keep=$ALMA_SERIAL dead=2 pool=/
     else keep=$BAZZITE_SERIAL dead=1 pool=/var; fi   # Bazzite's / is not the pool; /var is, read-write
@@ -695,6 +766,8 @@ for s in "${steps[@]}"; do
         install-silverblue) [[ -f $WORK/alma.done ]] || die "run install-alma first"; install silverblue ;;
         check-alma)         (step_check_alma) ;;
         check-bazzite)      (step_check_bazzite) ;;
+        install-bazzite)    (step_install_bazzite) ;;
+        check-bazzite-bootc) (step_check_bazzite_bootc) ;;
         degraded-alma)      (step_degraded alma) ;;
         degraded-bazzite)   (step_degraded bazzite) ;;
         *) die "unknown step: $s" ;;
