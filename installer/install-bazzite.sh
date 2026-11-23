@@ -165,8 +165,19 @@ in_image bootupctl backend install --write-uuid --update-firmware --auto \
 [[ -d $T/boot/efi/EFI/fedora ]] || die "bootupd did not install to Bazzite's ESP ($ESP)"
 [[ ! -e /boot/efi/EFI/fedora ]] || die "Bazzite's bootloader ended up on Alma's ESP (/boot/efi/EFI/fedora)"
 
-# bootupd puts its new entry first. Keep Alma the default: the old order,
-# then whatever is new.
+# bootupd can't always reach the firmware variables from the container (in CI
+# it added nothing). Then add the entry here, from Alma, pointing at drive 2's ESP.
+ESP_PARTUUID=$(blkid -s PARTUUID -o value "$ESP")
+if ! efibootmgr -v | grep -qi "$ESP_PARTUUID"; then
+    case $(uname -m) in x86_64) shim=shimx64.efi ;; aarch64) shim=shimaa64.efi ;; *) die "unsupported arch $(uname -m)" ;; esac
+    [[ -f $T/boot/efi/EFI/fedora/$shim ]] || die "no $shim in Bazzite's ESP ($ESP)"
+    step "adding a firmware boot entry for Bazzite (\\EFI\\fedora\\$shim on $ESP)"
+    efibootmgr -q -c -d "$D2" -p 2 -L Bazzite -l "\\EFI\\fedora\\$shim"
+fi
+efibootmgr -v | grep -qi "$ESP_PARTUUID" || die "no firmware boot entry for Bazzite's ESP ($ESP)"
+
+# bootupd and efibootmgr -c put the new entry first. Keep Alma the default: the
+# old order, then whatever is new.
 if [[ -n $ORDER ]]; then
     now=$(efibootmgr | sed -n 's/^BootOrder: //p')
     added=$(tr ',' '\n' <<<"$now" | grep -vxF -f <(tr ',' '\n' <<<"$ORDER") | paste -sd, || true)
@@ -182,6 +193,8 @@ step "configuring $DEP"
 
 # The deployment's /var is empty until boot mounts the stateroot's over it.
 VAR=$(dirname "$(dirname "$DEP")")/var
+# Everything changed after this is relabelled below; what bootc wrote is not.
+STAMP=$(mktemp)
 mkdir -p "$DEP/proc" "$VAR/home"
 mount -t proc proc "$DEP/proc"
 mount --bind "$VAR" "$DEP/var"
@@ -239,13 +252,19 @@ UNIT
 chroot "$DEP" systemctl enable minipool-initramfs-firstboot.service
 umount "$DEP/proc"
 
-# Label what was written here. Bazzite's own setfiles and policy: Alma's
-# setfiles can't read Bazzite's newer file_contexts and rejects its types.
-step "relabelling /etc and /var/home"
-rel=${DEP#"$T"}
+# Label what was written here, and only that. Bazzite's own setfiles and
+# policy: Alma's setfiles can't read Bazzite's newer file_contexts. Relabelling
+# all of /etc fails: some of the types Bazzite's policy gives files bootc wrote
+# (/etc/kmscon, /etc/openvpn) are unknown to Alma's running kernel, which
+# refuses to set them ("Invalid argument"). Ours all use common types.
+step "relabelling the files written here"
+in_dep="/target${DEP#"$T"}"
+mapfile -t RELABEL < <(cd "$DEP" && find etc -cnewer "$STAMP" ! -type d -printf '/%p\n')
+RELABEL=("${RELABEL[@]/#/$in_dep}" "$in_dep/etc/minipool" "$in_dep/var/home")
+rm -f "$STAMP"
 # shellcheck disable=SC2016  # expands in the container
-in_image sh -c 'set -e; d=/target$1; p=$(ls "$d"/etc/selinux/targeted/policy/policy.* | sort -V | tail -1)
-    setfiles -c "$p" -r "$d" "$d/etc/selinux/targeted/contexts/files/file_contexts" "$d/etc" "$d/var/home"' _ "$rel"
+in_image sh -c 'set -e; d=$1; shift; p=$(ls "$d"/etc/selinux/targeted/policy/policy.* | sort -V | tail -1)
+    setfiles -v -c "$p" -r "$d" "$d/etc/selinux/targeted/contexts/files/file_contexts" "$@"' _ "$in_dep" "${RELABEL[@]}"
 umount "$DEP/var"
 
 cleanup
