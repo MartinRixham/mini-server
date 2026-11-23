@@ -630,13 +630,10 @@ step_check_bazzite_bootc() {
     source "$WORK/config.env"
     local want="ostree-image-signed:docker://$BAZZITE_IMAGE" ref
     boot "$BAZZITE_SERIAL" boot-bazzite-bootc
-    vm_ssh rpm-ostree status -v | tee "$LOGS/bazzite-bootc-status.txt"
-    vm_ssh cat /proc/cmdline | tee "$LOGS/bazzite-cmdline.txt"
-    ref=$(booted_image || true)
-    if [[ $ref == "$want" ]]; then ok "booted $want"; else bad "booted image is '$ref', want $want"; fi
-    guest_check bazzite || CHECK_FAILED=1
 
-    # The first-boot unit adds the initramfs overlay, reboots, then removes itself.
+    # The first-boot unit adds the initramfs overlay, reboots, then removes
+    # itself. The reboot can come seconds after SSH is up, so nothing is
+    # checked until it has happened: every SSH call before then may drop.
     # shellcheck disable=SC2016  # expands in the guest
     local gone='test ! -e /etc/systemd/system/minipool-initramfs-firstboot.service &&
         [ "$(systemctl show -P ActiveState minipool-initramfs-firstboot.service)" = inactive ] && echo gone'
@@ -651,9 +648,12 @@ step_check_bazzite_bootc() {
         vm_running || die "VM exited during the first-boot reboot"
         sleep 20
     done
-    vm_ssh rpm-ostree status
+    vm_ssh rpm-ostree status -v | tee "$LOGS/bazzite-bootc-status.txt"
+    vm_ssh cat /proc/cmdline | tee "$LOGS/bazzite-cmdline.txt"
 
     info "checks (after the first-boot reboot)"
+    ref=$(booted_image || true)
+    if [[ $ref == "$want" ]]; then ok "booted $want"; else bad "booted image is '$ref', want $want"; fi
     guest_check bazzite || CHECK_FAILED=1
     check_settled
     check_deployments "$want"
