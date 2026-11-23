@@ -42,7 +42,7 @@ fi
 fetch() {  # url dest
     [[ -f $2 ]] && return 0
     info "downloading ${1##*/}"
-    curl -fL --retry 3 -o "$2.part" "$1"
+    curl -fL --retry 5 --retry-all-errors -C - -o "$2.part" "$1"
     mv "$2.part" "$2"
 }
 
